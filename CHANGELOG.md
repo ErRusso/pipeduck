@@ -22,6 +22,7 @@ All notable changes to PipeDuck are documented here. The format follows
 - Single-instance tray lock.
 - CMake install rules, desktop entry, hicolor icons and man page.
 - Unit tests and GitHub Actions CI.
+- Original PipeDuck logo, tray mark, active-state icon and full hicolor/symbolic icon set.
 
 ### Fixed
 

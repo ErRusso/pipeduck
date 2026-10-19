@@ -5,6 +5,7 @@ Copyright (c) 2026 Gerhard Schwanzer
 https://github.com/geri1701/pw-duck
 Licensed under the MIT License.
 
-The virtual-sink ducking design, configuration schema, command set and tray
-icon artwork are derived from pw-duck. The original project and its author are
-credited in the README and in this notice.
+The virtual-sink ducking design, configuration schema and command set are
+derived from pw-duck. The PipeDuck logo and icon artwork are original project
+artwork supplied by the PipeDuck author. The original project and its author
+are credited in the README and in this notice.

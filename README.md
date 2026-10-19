@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icons/hicolor/256x256/apps/pipeduck.png" alt="PipeDuck logo" width="256">
+</p>
+
 # PipeDuck
 
 **Automatic audio ducking for PipeWire — for remote calls, your own microphone, or both.**
@@ -270,6 +274,13 @@ Format the sources with:
 clang-format -i $(git ls-files 'src/*.cpp' 'include/*.hpp' 'tests/*.cpp')
 ```
 
+Regenerate the application, symbolic and tray icons after editing the master logo:
+
+```bash
+python3 -m pip install pillow
+scripts/generate-icons.py
+```
+
 The unit tests cover TOML parsing, identity matching, VAD hysteresis, port pairing, Pulse JSON
 parsing and the volume-ramp curve. An optional integration test against a live local PipeWire
 session is described in [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -286,8 +297,9 @@ session is described in [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Credits
 
 PipeDuck is based on [pw-duck](https://github.com/geri1701/pw-duck) by
-[Gerhard Schwanzer](https://github.com/geri1701), released under the MIT License. The tray icon
-artwork and the original architecture are reused with attribution; see [NOTICE](NOTICE).
+[Gerhard Schwanzer](https://github.com/geri1701), released under the MIT License. The original
+routing architecture and command design are reused with attribution. The PipeDuck logo and icon
+set are original project artwork; see [NOTICE](NOTICE).
 
 ## License
 

@@ -42,6 +42,26 @@ cmake -S . -B build -DPIPEDUCK_GUI=OFF
 - Add or update unit tests for pure logic changes (VAD, config, identity matching, port pairing,
   ramps).
 
+## Regenerating icons
+
+The master logo is `assets/icons/source-pipeduck.png` (1024x1024). After changing it, regenerate
+the hicolor application icons, symbolic icons and StatusNotifierItem ARGB pixmaps:
+
+```bash
+python3 -m pip install pillow
+scripts/generate-icons.py
+```
+
+The script writes:
+
+- `assets/icons/hicolor/<size>/apps/pipeduck.png`
+- `assets/icons/hicolor/<size>/apps/pipeduck-symbolic.png`
+- `assets/icons/pixmap/pipeduck-<size>.argb`
+- `assets/icons/pixmap/pipeduck-on-<size>.argb`
+- `assets/icons/source-pipeduck-mark.png` and `source-pipeduck-on.png`
+
+Commit the generated assets together with the master. CMake embeds the ARGB pixmaps at build time.
+
 ## Integration testing
 
 The unit suite does not require an audio server. To test against a live PipeWire session safely,
