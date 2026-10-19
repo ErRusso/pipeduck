@@ -186,6 +186,7 @@ struct TrayApp {
     guint idle_source = 0;
     guint name_owner = 0;
     std::string service_name;
+    bool unique_registration = false;
 
     SettingsStore settings;
     std::thread worker;
@@ -885,8 +886,9 @@ void TrayApp::register_with_watcher() {
     GVariant* result = g_dbus_connection_call_sync(
         bus, "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
         "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
-        g_variant_new("(s)", service_name.empty() ? g_dbus_connection_get_unique_name(bus)
-                                                  : service_name.c_str()),
+        g_variant_new("(s)", unique_registration || service_name.empty()
+                                 ? g_dbus_connection_get_unique_name(bus)
+                                 : service_name.c_str()),
         nullptr, G_DBUS_CALL_FLAGS_NONE, 2000, nullptr, &error);
     if (result != nullptr) {
         g_variant_unref(result);
@@ -1164,6 +1166,31 @@ GVariant* on_menu_get_property(GDBusConnection*, const gchar*, const gchar*, con
     return nullptr;
 }
 
+bool status_notifier_watcher_is_ashell() {
+    const auto result =
+        run_command("busctl", {"--user", "--no-pager", "status", "org.kde.StatusNotifierWatcher"},
+                    std::chrono::milliseconds(2000));
+    if (result.exit_code != 0) {
+        return false;
+    }
+    for (const auto& raw_line : split_lines(result.out)) {
+        const std::string line = trim(raw_line);
+        if (line == "Comm=ashell" || line == "CommandLine=ashell" ||
+            starts_with(line, "CommandLine=ashell ")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool use_unique_sni_name() {
+    if (const auto value = getenv_string("PIPEDUCK_SNI_UNIQUE_NAME")) {
+        const std::string lower = to_lower(*value);
+        return lower != "0" && lower != "false" && lower != "no";
+    }
+    return status_notifier_watcher_is_ashell();
+}
+
 std::string lock_path_string() {
     const auto path = runtime_dir() / "pipeduck" / "tray.lock";
     std::filesystem::create_directories(path.parent_path());
@@ -1244,6 +1271,7 @@ int run_tray(const TrayOptions& options) {
                                  (error != nullptr ? error->message : "unknown"));
     }
 
+    app.unique_registration = use_unique_sni_name();
     app.service_name = "org.kde.StatusNotifierItem-" + std::to_string(getpid()) + "-1";
     app.name_owner = g_bus_own_name_on_connection(
         app.bus, app.service_name.c_str(), G_BUS_NAME_OWNER_FLAGS_NONE,
