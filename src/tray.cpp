@@ -115,6 +115,7 @@ const char* kMenuXml = R"XML(
     <method name="GetLayout">
       <arg name="parentId" type="i" direction="in"/>
       <arg name="recursionDepth" type="i" direction="in"/>
+      <arg name="propertyNames" type="as" direction="in"/>
       <arg name="revision" type="u" direction="out"/>
       <arg name="layout" type="a(ia{sv}av)" direction="out"/>
     </method>
@@ -1009,9 +1010,19 @@ void handle_menu_method_call(GDBusConnection*, const gchar*, const gchar*, const
     if (std::strcmp(method_name, "GetLayout") == 0) {
         int32_t parent = 0;
         int32_t depth = -1;
-        g_variant_get(parameters, "(ii)", &parent, &depth);
+        GVariant* property_names = nullptr;
+        // The current DBusMenu signature is (iias). Tolerate older two-argument
+        // callers as well, since several tray implementations still send (ii).
+        if (g_variant_is_of_type(parameters, G_VARIANT_TYPE("(iias)"))) {
+            g_variant_get(parameters, "(ii@as)", &parent, &depth, &property_names);
+        } else {
+            g_variant_get(parameters, "(ii)", &parent, &depth);
+        }
         GVariant* layout =
             parent == 0 ? build_root_layout(*app) : build_submenu_layout(*app, parent);
+        if (property_names != nullptr) {
+            g_variant_unref(property_names);
+        }
         g_dbus_method_invocation_return_value(
             invocation, g_variant_new("(u@a(ia{sv}av))", app->menu_revision, layout));
         return;
