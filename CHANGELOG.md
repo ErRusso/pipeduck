@@ -4,15 +4,6 @@ All notable changes to PipeDuck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [1.0.1] - 2026-10-19
-
-### Fixed
-
-- DBusMenu `GetLayout` now implements the standard third `propertyNames` argument. GNOME's
-  AppIndicator/KStatusNotifierItem extension sends this argument, so the tray context menu failed
-  to load and right-click appeared to do nothing. The menu now opens correctly and exposes all
-  configuration items.
-
 ## [1.0.0] - 2026-10-19
 
 ### Added
@@ -31,6 +22,12 @@ All notable changes to PipeDuck are documented here. The format follows
 - Single-instance tray lock.
 - CMake install rules, desktop entry, hicolor icons and man page.
 - Unit tests and GitHub Actions CI.
+
+### Fixed
+
+- Tray right-click menu implemented as a single DBusMenu root item with the full `(iias)`
+  `GetLayout` signature. This matches libdbusmenu/ksni and GNOME's AppIndicator extension, so the
+  context menu opens reliably and exposes source, microphone, trigger, tuner and quit controls.
 
 ### Credits
 

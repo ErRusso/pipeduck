@@ -20,7 +20,8 @@ UI, terminal and GTK4 tuners, smooth volume ramps and microphone-triggered ducki
 - **Smooth fades** — configurable fade-down and fade-back times; the return to 100% volume is a
   real smoothstep ramp instead of an abrupt jump.
 - **Tray control** — StatusNotifierItem/SNI tray icon with live status, source/mic selection,
-  trigger selection, tuning and a on/off switch.
+  trigger selection, tuning and an on/off switch. Left-click toggles ducking; right-click opens
+  the full configuration menu.
 - **Live tuners** — terminal (`pipeduck tune`) and GTK4 (`pipeduck tune-gui`).
 - **Config hot reload** — changes from either tuner apply to a running tray immediately.
 - **Safe routing** — temporary virtual sink, automatic stream restore, and a safety fallback that
@@ -75,7 +76,8 @@ cmake --install build --prefix "$HOME/.local"
    pipeduck
    ```
 
-3. Open the tray menu and choose **Source: choose** → the stream that contains call audio.
+3. Right-click the tray icon, then choose **Source: choose** → the stream that contains call
+   audio.
 4. Choose a trigger under **Trigger**:
    - **Call audio** — duck when remote participants speak.
    - **My microphone** — duck when you speak.

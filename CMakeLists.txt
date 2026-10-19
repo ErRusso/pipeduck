@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(pipeduck
-    VERSION 1.0.1
+    VERSION 1.0.0
     DESCRIPTION "Automatic audio ducking for PipeWire, controlled from the system tray"
     HOMEPAGE_URL "https://github.com/ErRusso/pipeduck"
     LANGUAGES CXX)

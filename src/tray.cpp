@@ -117,7 +117,7 @@ const char* kMenuXml = R"XML(
       <arg name="recursionDepth" type="i" direction="in"/>
       <arg name="propertyNames" type="as" direction="in"/>
       <arg name="revision" type="u" direction="out"/>
-      <arg name="layout" type="a(ia{sv}av)" direction="out"/>
+      <arg name="layout" type="(ia{sv}av)" direction="out"/>
     </method>
     <method name="GetGroupProperties">
       <arg name="ids" type="ai" direction="in"/>
@@ -496,12 +496,10 @@ GVariant* build_root_layout(TrayApp& app) {
     items.push_back(make_item(kIdTuner, app.tuner_label(), app.tuner_enabled()));
     items.push_back(make_item(kIdQuit, "Quit", !app.quitting));
 
-    GVariantBuilder builder;
-    g_variant_builder_init(&builder, G_VARIANT_TYPE("a(ia{sv}av)"));
-    for (GVariant* item : items) {
-        g_variant_builder_add_value(&builder, item);
-    }
-    return g_variant_builder_end(&builder);
+    // DBusMenu GetLayout returns a single root item (id 0) whose children are
+    // the top-level menu entries. This is what libdbusmenu, ksni and the GNOME
+    // AppIndicator extension expect.
+    return make_item(0, "", true, std::nullopt, make_children(items));
 }
 
 GVariant* build_submenu_layout(TrayApp& app, int parent) {
@@ -520,39 +518,46 @@ GVariant* build_submenu_layout(TrayApp& app, int parent) {
     } else if (parent == kIdMicMenu) {
         items = mic_children(config);
     }
-    GVariantBuilder builder;
-    g_variant_builder_init(&builder, G_VARIANT_TYPE("a(ia{sv}av)"));
-    for (GVariant* item : items) {
-        g_variant_builder_add_value(&builder, item);
-    }
-    return g_variant_builder_end(&builder);
+    return make_item(parent, "", true, std::nullopt, make_children(items));
 }
 
 GVariant* find_props_in_children(GVariant* children, int wanted);
 
-GVariant* find_props_in_layout(GVariant* layout, int wanted) {
-    GVariantIter iterator;
-    g_variant_iter_init(&iterator, layout);
-    GVariant* item = nullptr;
-    while ((item = g_variant_iter_next_value(&iterator)) != nullptr) {
-        int32_t id = 0;
-        GVariant* props = nullptr;
-        GVariant* children = nullptr;
-        g_variant_get(item, "(i@a{sv}@av)", &id, &props, &children);
-        if (id == wanted) {
-            g_variant_unref(children);
-            g_variant_unref(item);
-            return props;
-        }
-        GVariant* found = find_props_in_children(children, wanted);
+GVariant* find_props_in_item(GVariant* item, int wanted) {
+    int32_t id = 0;
+    GVariant* props = nullptr;
+    GVariant* children = nullptr;
+    g_variant_get(item, "(i@a{sv}@av)", &id, &props, &children);
+    if (id == wanted) {
         g_variant_unref(children);
-        g_variant_unref(props);
-        g_variant_unref(item);
-        if (found != nullptr) {
-            return found;
+        return props;
+    }
+    GVariant* found = find_props_in_children(children, wanted);
+    g_variant_unref(children);
+    g_variant_unref(props);
+    return found;
+}
+
+void collect_item_properties(GVariant* item, GVariantBuilder& builder) {
+    int32_t id = 0;
+    GVariant* props = nullptr;
+    GVariant* children = nullptr;
+    g_variant_get(item, "(i@a{sv}@av)", &id, &props, &children);
+    g_variant_builder_add(&builder, "(i@a{sv})", id, props);
+
+    GVariantIter iterator;
+    g_variant_iter_init(&iterator, children);
+    GVariant* child = nullptr;
+    while ((child = g_variant_iter_next_value(&iterator)) != nullptr) {
+        GVariant* nested = nullptr;
+        g_variant_get(child, "v", &nested);
+        g_variant_unref(child);
+        if (nested != nullptr) {
+            collect_item_properties(nested, builder);
+            g_variant_unref(nested);
         }
     }
-    return nullptr;
+    g_variant_unref(children);
 }
 
 GVariant* find_props_in_children(GVariant* children, int wanted) {
@@ -1026,7 +1031,7 @@ void handle_menu_method_call(GDBusConnection*, const gchar*, const gchar*, const
             g_variant_unref(property_names);
         }
         g_dbus_method_invocation_return_value(
-            invocation, g_variant_new("(u@a(ia{sv}av))", app->menu_revision, layout));
+            invocation, g_variant_new("(u@(ia{sv}av))", app->menu_revision, layout));
         return;
     }
 
@@ -1041,24 +1046,13 @@ void handle_menu_method_call(GDBusConnection*, const gchar*, const gchar*, const
         g_variant_iter_init(&iterator, ids);
         int32_t id = 0;
         while (g_variant_iter_next(&iterator, "i", &id)) {
-            GVariant* props = find_props_in_layout(layout, id);
+            GVariant* props = find_props_in_item(layout, id);
             if (props != nullptr) {
                 g_variant_builder_add(&builder, "(i@a{sv})", id, props);
             }
         }
         if (g_variant_n_children(ids) == 0) {
-            GVariantIter items;
-            g_variant_iter_init(&items, layout);
-            GVariant* item = nullptr;
-            while ((item = g_variant_iter_next_value(&items)) != nullptr) {
-                int32_t item_id = 0;
-                GVariant* props = nullptr;
-                GVariant* children = nullptr;
-                g_variant_get(item, "(i@a{sv}@av)", &item_id, &props, &children);
-                g_variant_builder_add(&builder, "(i@a{sv})", item_id, props);
-                g_variant_unref(children);
-                g_variant_unref(item);
-            }
+            collect_item_properties(layout, builder);
         }
         g_variant_unref(ids);
         g_variant_unref(names);
@@ -1073,7 +1067,7 @@ void handle_menu_method_call(GDBusConnection*, const gchar*, const gchar*, const
         const char* property = nullptr;
         g_variant_get(parameters, "(i&s)", &id, &property);
         GVariant* layout = build_root_layout(*app);
-        GVariant* props = find_props_in_layout(layout, id);
+        GVariant* props = find_props_in_item(layout, id);
         GVariant* value = nullptr;
         if (props != nullptr) {
             value = g_variant_lookup_value(props, property, nullptr);
