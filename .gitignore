@@ -1,0 +1,18 @@
+# Build output
+/build/
+/build-*/
+/compile_commands.json
+
+# Editors and caches
+.cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local logs and packaging artifacts
+*.log
+/pkg/
+/src/pipeduck-*/
+/pipeduck-*.tar.gz
+/*.pkg.tar.*

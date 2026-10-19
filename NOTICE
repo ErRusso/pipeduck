@@ -1,0 +1,10 @@
+PipeDuck is a C++ reimplementation of pw-duck.
+
+pw-duck
+Copyright (c) 2026 Gerhard Schwanzer
+https://github.com/geri1701/pw-duck
+Licensed under the MIT License.
+
+The virtual-sink ducking design, configuration schema, command set and tray
+icon artwork are derived from pw-duck. The original project and its author are
+credited in the README and in this notice.

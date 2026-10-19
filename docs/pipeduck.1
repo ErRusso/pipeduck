@@ -1,0 +1,109 @@
+.TH PIPEDUCK 1 "October 2026" "pipeduck 1.0.0" "User Commands"
+.SH NAME
+pipeduck \- automatic audio ducking for PipeWire
+.SH SYNOPSIS
+.B pipeduck
+[\fICOMMAND\fR] [\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B pipeduck
+lowers music, games, videos and other playback while speech is detected in a
+selected voice-call stream, in the local microphone, or both. It is designed for
+PipeWire desktops and is normally controlled from a StatusNotifierItem tray icon.
+.PP
+Audio is routed through a temporary virtual sink. The virtual sink monitor volume
+is faded down and smoothly back to 100% with a configurable smoothstep ramp.
+.SH COMMANDS
+.TP
+.B tray
+Start the tray (default).
+.TP
+.B status
+Show the default sink, playback streams, trigger and current tuning.
+.TP
+.B sources
+List playback streams selectable as call audio.
+.TP
+.BI "select-source " ID
+Save a playback stream as the voice-call source.
+.TP
+.B mic-sources
+List microphones selectable for microphone-triggered ducking.
+.TP
+.BI "select-mic " "NAME|ID"
+Save a microphone by source name or index.
+.TP
+.B tune
+Open the terminal tuner.
+.TP
+.B tune-gui
+Open the GTK4 tuner when built with GUI support.
+.TP
+.B route
+Route streams and duck until interrupted. Requires
+.BR \-\-yes\-really\-route .
+.TP
+.B route-once
+Route for a few seconds as a diagnostic. Requires
+.BR \-\-yes\-really\-route .
+.TP
+.B config-path
+Print the configuration file path.
+.TP
+.B init-config
+Create a default configuration if none exists.
+.SH OPTIONS
+.TP
+.BI "\-\-duck\-percent " N
+Volume for non-call audio while speech is active (0-100).
+.TP
+.BI "\-\-vad\-threshold " F
+Base RMS threshold. Speech starts above about twice this value.
+.TP
+.BI "\-\-hold\-ms " N
+Keep ducking active for N milliseconds after speech stops.
+.TP
+.BI "\-\-fade\-ms " N
+Smooth return time in milliseconds (overrides release_fade_ms).
+.TP
+.BI "\-\-trigger " MODE
+One of
+.IR call ,
+.I mic
+or
+.IR both .
+.TP
+.BI "\-\-seconds " N
+Duration for route-once (default 5).
+.TP
+.B \-\-yes\-really\-route
+Acknowledge that the command changes the live PipeWire graph.
+.TP
+.B \-h, \-\-help
+Show usage.
+.TP
+.B \-V, \-\-version
+Show the version.
+.SH FILES
+.TP
+.I ~/.config/pipeduck/config.toml
+Configuration file. Changes are polled by a running tray and applied live.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Overrides the base configuration directory.
+.TP
+.B XDG_RUNTIME_DIR
+Used for the single-instance tray lock.
+.TP
+.B PIPEDUCK_ICON_THEME_PATH
+Overrides the icon theme search path.
+.SH EXIT STATUS
+0 on success, 1 on error. Diagnostic routing commands also return 1 when the
+safety flag is missing.
+.SH SEE ALSO
+.BR pactl (1),
+.BR pw-link (1),
+.BR pipewire (1),
+.BR wireplumber (1)
+.SH LICENSE
+MIT License. PipeDuck is based on pw-duck by Gerhard Schwanzer.

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PipeDuck
+GenericName=Audio Ducking
+Comment=Automatically duck other audio while a call or your microphone is active
+Exec=pipeduck tray
+Icon=pipeduck
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=audio;ducking;pipewire;tray;voice;microphone;
+StartupNotify=false
