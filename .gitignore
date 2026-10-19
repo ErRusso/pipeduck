@@ -16,3 +16,7 @@
 /src/pipeduck-*/
 /pipeduck-*.tar.gz
 /*.pkg.tar.*
+
+# Python cache
+__pycache__/
+*.pyc
