@@ -109,12 +109,12 @@ struct RouteSession::Impl {
     std::unique_ptr<VirtualSink> virtual_sink;
     std::string virtual_sink_name;
     uint32_t virtual_sink_index = 0;
-    std::string original_default_sink_name;
     std::string real_sink_name;
     uint32_t real_sink_index = 0;
     std::map<uint32_t, uint32_t> moved_inputs;
     std::vector<PortLink> monitor_links;
     std::unique_ptr<VolumeController> volume;
+    VolumeRamp ramp;
     bool stopped = false;
 
     std::string monitor_source_name() const {
@@ -149,14 +149,41 @@ void RouteSession::set_percent(double percent) {
     volume_percent_ = percent;
 }
 
+void RouteSession::start_ramp(double percent, int duration_ms) {
+    if (impl_ == nullptr || impl_->stopped) {
+        return;
+    }
+    impl_->ramp.start(volume_percent_, percent, duration_ms);
+    if (!impl_->ramp.active()) {
+        set_percent(percent);
+    }
+}
+
+void RouteSession::tick_ramp() {
+    if (impl_ == nullptr || impl_->stopped || !impl_->ramp.active()) {
+        return;
+    }
+    const double value = impl_->ramp.update();
+    set_percent(value);
+}
+
+bool RouteSession::ramp_active() const {
+    return impl_ != nullptr && !impl_->stopped && impl_->ramp.active();
+}
+
 void RouteSession::ramp_to(double percent, int duration_ms, const std::atomic<bool>* stop) {
     if (impl_ == nullptr || impl_->stopped) {
         return;
     }
-    const double from = volume_percent_;
-    run_volume_ramp(from, percent, duration_ms, 20, stop,
-                    [this](double value) { set_percent(value); });
-    volume_percent_ = percent;
+    start_ramp(percent, duration_ms);
+    while (impl_->ramp.active()) {
+        if (stop != nullptr && stop->load()) {
+            impl_->ramp.cancel();
+            break;
+        }
+        tick_ramp();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 }
 
 void RouteSession::set_neutral(int fade_ms) {
@@ -216,11 +243,8 @@ void RouteSession::stop() {
     }
     impl_->stopped = true;
     const PulseCtl pulse;
-    try {
-        pulse.set_default_sink(impl_->original_default_sink_name);
-    } catch (const std::exception& error) {
-        std::cerr << "pipeduck: could not restore default sink: " << error.what() << "\n";
-    }
+    // Never restore the captured default here: the user may have switched
+    // outputs while ducking was active. Only the streams we moved are restored.
 
     try {
         for (const auto& input : pulse.sink_inputs_on_sink(impl_->virtual_sink_index)) {
@@ -289,10 +313,6 @@ void RouteSession::stop() {
         std::cerr << "pipeduck: could not destroy virtual sink: " << error.what() << "\n";
     }
     impl_->volume.reset();
-    try {
-        pulse.set_default_sink(impl_->original_default_sink_name);
-    } catch (const std::exception&) {
-    }
 }
 
 RoutingEngine::RoutingEngine(std::optional<ConfiguredSource> voice_source,
@@ -307,29 +327,15 @@ RouteSession RoutingEngine::start(const RoutingOptions& options) {
     const PulseCtl pulse;
     const std::string original_default = pulse.default_sink_name();
 
-    std::optional<Sink> real_sink;
-    if (voice_source_.has_value()) {
-        for (const auto& input : pulse.sink_inputs()) {
-            if (input.identity().matches_configured_source(*voice_source_)) {
-                real_sink = pulse.sink_by_index(input.sink);
-                if (!real_sink.has_value()) {
-                    throw std::runtime_error("voice source sink #" + std::to_string(input.sink) +
-                                             " disappeared");
-                }
-                break;
-            }
-        }
-    }
+    // Always route against the current default output. The voice-call stream is
+    // excluded from ducking, but it no longer pins routing to a stale device.
+    const std::optional<Sink> real_sink = pulse.sink_by_name(original_default);
     if (!real_sink.has_value()) {
-        real_sink = pulse.sink_by_name(original_default);
-        if (!real_sink.has_value()) {
-            throw std::runtime_error("default sink " + original_default + " not found");
-        }
+        throw std::runtime_error("default sink " + original_default + " not found");
     }
 
     RouteSession session;
     RouteSession::Impl& impl = *session.impl_;
-    impl.original_default_sink_name = original_default;
     impl.real_sink_name = real_sink->name;
     impl.real_sink_index = real_sink->index;
     impl.volume = std::make_unique<VolumeController>();

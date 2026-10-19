@@ -34,6 +34,9 @@ struct ConfiguredMic {
 struct Config {
     int duck_percent = 25;
     double vad_threshold = 0.01;
+    // Optional microphone-specific threshold. When unset, vad_threshold is used
+    // so configurations written by older versions behave exactly as before.
+    std::optional<double> mic_vad_threshold;
     int hold_ms = 700;
     int attack_fade_ms = 80;
     int release_fade_ms = 320;

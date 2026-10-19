@@ -22,6 +22,7 @@
 #include "pipeduck/routing.hpp"
 #include "pipeduck/tray.hpp"
 #include "pipeduck/tune.hpp"
+#include "pipeduck/vad.hpp"
 
 namespace {
 
@@ -90,6 +91,9 @@ pipeduck::DuckingSettings resolve_settings(const pipeduck::Config& config,
     if (cli.vad_threshold.has_value()) {
         settings.vad_threshold = *cli.vad_threshold;
     }
+    if (cli.mic_vad_threshold.has_value()) {
+        settings.mic_vad_threshold = *cli.mic_vad_threshold;
+    }
     if (cli.hold_ms.has_value()) {
         settings.hold_ms = *cli.hold_ms;
     }
@@ -122,9 +126,15 @@ void print_status(const pipeduck::PulseCtl& pulse, const pipeduck::Config& confi
         std::cout << "Default microphone: " << pulse.default_source_name() << "\n";
     } catch (const std::exception&) {
     }
+    const double mic_threshold = config.mic_vad_threshold.value_or(config.vad_threshold);
     std::cout << "Trigger: " << pipeduck::trigger_name(config.trigger) << "\n";
     std::cout << "Ducking: " << config.duck_percent << "%, hold " << config.hold_ms
               << " ms, return fade " << config.release_fade_ms << " ms\n";
+    std::cout << "Thresholds: call " << pipeduck::format_double(config.vad_threshold, 4)
+              << " (start "
+              << pipeduck::format_double(pipeduck::vad_start_threshold(config.vad_threshold), 4)
+              << "), microphone " << pipeduck::format_double(mic_threshold, 4) << " (start "
+              << pipeduck::format_double(pipeduck::vad_start_threshold(mic_threshold), 4) << ")\n";
 
     try {
         const auto inputs = pulse.sink_inputs();

@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,7 +38,6 @@ constexpr const char* kSniPath = "/StatusNotifierItem";
 constexpr const char* kSniInterface = "org.kde.StatusNotifierItem";
 constexpr const char* kMenuPath = "/MenuBar";
 constexpr const char* kMenuInterface = "com.canonical.dbusmenu";
-constexpr const char* kMenuObjectLabel = "MenuBar";
 
 enum MenuId {
     kIdInfoHeader = 1,
@@ -55,8 +55,12 @@ enum MenuId {
     kIdMicMenu = 40,
     kIdTuner = 50,
     kIdQuit = 60,
+    kIdMicError = 999998,
+    kIdSourceError = 999999,
     kIdSourceBase = 1000000,
     kIdMicBase = 2000000,
+    kIdSourceGroupBase = 3000000,
+    kIdMicGroupBase = 4000000,
 };
 
 const char* kSniXml = R"XML(
@@ -185,6 +189,7 @@ struct TrayApp {
     guint menu_registration = 0;
     guint registration_timer = 0;
     guint idle_source = 0;
+    guint refresh_timer = 0;
     guint name_owner = 0;
     std::string service_name;
     bool unique_registration = false;
@@ -206,6 +211,8 @@ struct TrayApp {
     std::optional<std::string> mic_label;
     bool quitting = false;
     uint32_t menu_revision = 1;
+    uint64_t last_cache_revision = 0;
+    std::optional<std::filesystem::file_time_type> last_config_mtime;
 
     int lock_fd = -1;
 
@@ -216,6 +223,9 @@ struct TrayApp {
         }
         if (idle_source != 0) {
             g_source_remove(idle_source);
+        }
+        if (refresh_timer != 0) {
+            g_source_remove(refresh_timer);
         }
         if (name_owner != 0) {
             g_bus_unown_name(name_owner);
@@ -301,6 +311,7 @@ struct TrayApp {
     void post_event(const DuckingEvent& event);
     void dispatch_events();
     void notify_changed();
+    void poll_external_state();
     void request_quit();
     void open_tuner();
     void select_source(uint32_t index);
@@ -402,27 +413,94 @@ std::vector<GVariant*> trigger_children(const Config& config) {
     return items;
 }
 
+std::string application_group_key(const AudioIdentity& identity) {
+    const auto first = [](const std::optional<std::string>& value) -> std::optional<std::string> {
+        if (value.has_value() && !value->empty()) {
+            return value;
+        }
+        return std::nullopt;
+    };
+    if (const auto name = first(identity.application_name)) {
+        return *name;
+    }
+    if (const auto binary = first(identity.application_process_binary)) {
+        return *binary;
+    }
+    if (const auto media = first(identity.media_name)) {
+        return *media;
+    }
+    return "Unknown application";
+}
+
+std::string stream_label(const SinkInput& input) {
+    const auto identity = input.identity();
+    std::string label = "#" + std::to_string(input.index);
+    if (identity.looks_like_voice_source()) {
+        label += " voice?";
+    }
+    if (identity.media_name.has_value() && !identity.media_name->empty()) {
+        label += " " + *identity.media_name;
+    } else {
+        label += " " + source_label(identity);
+    }
+    return label;
+}
+
+std::string microphone_group_key(const Source& source) {
+    return source.description.empty() ? source.name : source.description;
+}
+
 std::vector<GVariant*> source_children() {
     std::vector<GVariant*> items;
     try {
         const PulseCtl pulse;
-        for (const auto& input : pulse.sink_inputs()) {
-            const auto identity = input.identity();
-            if (!identity.is_playback_stream()) {
+        const auto inputs = pulse.sink_inputs();
+
+        std::map<std::string, std::vector<const SinkInput*>> groups;
+        for (const auto& input : inputs) {
+            if (!input.identity().is_playback_stream()) {
                 continue;
             }
-            const std::string hint = identity.looks_like_voice_source() ? " voice?" : "";
+            groups[application_group_key(input.identity())].push_back(&input);
+        }
+
+        int group_ordinal = 0;
+        for (auto& [application, streams] : groups) {
+            std::sort(streams.begin(), streams.end(),
+                      [](const SinkInput* left, const SinkInput* right) {
+                          const auto left_name = left->identity().media_name.value_or("");
+                          const auto right_name = right->identity().media_name.value_or("");
+                          if (left_name != right_name) {
+                              return left_name < right_name;
+                          }
+                          return left->index < right->index;
+                      });
+
+            if (streams.size() == 1) {
+                const auto* input = streams.front();
+                items.push_back(make_item(static_cast<int>(kIdSourceBase + input->index),
+                                          stream_label(*input)));
+                continue;
+            }
+
+            std::vector<GVariant*> children;
+            children.reserve(streams.size());
+            for (const auto* input : streams) {
+                children.push_back(make_item(static_cast<int>(kIdSourceBase + input->index),
+                                             stream_label(*input)));
+            }
             const std::string label =
-                "#" + std::to_string(input.index) + hint + " " + source_label(identity);
-            items.push_back(make_item(static_cast<int>(kIdSourceBase + input.index), label));
+                application + " (" + std::to_string(streams.size()) + " streams)";
+            items.push_back(make_item(static_cast<int>(kIdSourceGroupBase + group_ordinal), label,
+                                      true, std::nullopt, make_children(children)));
+            ++group_ordinal;
         }
     } catch (const std::exception& error) {
-        items.push_back(make_item(static_cast<int>(kIdSourceBase) - 1,
-                                  std::string("Cannot read sources: ") + error.what(), false));
+        items.push_back(
+            make_item(kIdSourceError, std::string("Cannot read sources: ") + error.what(), false));
     }
     if (items.empty()) {
-        items.push_back(
-            make_item(static_cast<int>(kIdSourceBase) - 1, "No playback streams visible", false));
+        items.push_back(make_item(kIdSourceError, "No playback streams visible", false));
     }
     return items;
 }
@@ -436,29 +514,67 @@ std::vector<GVariant*> mic_children(const Config& config) {
     }
     try {
         const PulseCtl pulse;
-        for (const auto& source : pulse.sources()) {
+        const auto sources = pulse.sources();
+
+        std::map<std::string, std::vector<const Source*>> groups;
+        for (const auto& source : sources) {
             if (source.is_monitor) {
                 continue;
             }
-            const bool selected = config.mic_source.has_value() &&
-                                  config.mic_source->name.has_value() &&
-                                  *config.mic_source->name == source.name;
-            std::string label = "#" + std::to_string(source.index) + " " + source.name;
-            if (source.name == default_source) {
-                label += " (default)";
+            groups[microphone_group_key(source)].push_back(&source);
+        }
+
+        int group_ordinal = 0;
+        for (auto& [device, device_sources] : groups) {
+            std::sort(device_sources.begin(), device_sources.end(),
+                      [](const Source* left, const Source* right) {
+                          if (left->name != right->name) {
+                              return left->name < right->name;
+                          }
+                          return left->index < right->index;
+                      });
+
+            const auto selected = [&config](const Source& source) {
+                return config.mic_source.has_value() && config.mic_source->name.has_value() &&
+                       *config.mic_source->name == source.name;
+            };
+
+            if (device_sources.size() == 1) {
+                const auto& source = *device_sources.front();
+                std::string label = "#" + std::to_string(source.index) + " " + source.name;
+                if (source.name == default_source) {
+                    label += " (default)";
+                }
+                if (!source.description.empty()) {
+                    label += " - " + source.description;
+                }
+                items.push_back(make_item(static_cast<int>(kIdMicBase + source.index), label, true,
+                                          selected(source)));
+                continue;
             }
-            if (!source.description.empty()) {
-                label += " - " + source.description;
+
+            std::vector<GVariant*> children;
+            children.reserve(device_sources.size());
+            for (const auto* source : device_sources) {
+                std::string label = "#" + std::to_string(source->index) + " " + source->name;
+                if (source->name == default_source) {
+                    label += " (default)";
+                }
+                children.push_back(make_item(static_cast<int>(kIdMicBase + source->index), label,
+                                             true, selected(*source)));
             }
-            items.push_back(
-                make_item(static_cast<int>(kIdMicBase + source.index), label, true, selected));
+            const std::string label =
+                device + " (" + std::to_string(device_sources.size()) + " inputs)";
+            items.push_back(make_item(static_cast<int>(kIdMicGroupBase + group_ordinal), label,
+                                      true, std::nullopt, make_children(children)));
+            ++group_ordinal;
         }
     } catch (const std::exception& error) {
         items.push_back(
-            make_item(0, std::string("Cannot read microphones: ") + error.what(), false));
+            make_item(kIdMicError, std::string("Cannot read microphones: ") + error.what(), false));
     }
     if (items.empty()) {
-        items.push_back(make_item(0, "No microphones visible", false));
+        items.push_back(make_item(kIdMicError, "No microphones visible", false));
     }
     return items;
 }
@@ -481,9 +597,10 @@ GVariant* build_root_layout(TrayApp& app) {
     items.push_back(
         make_item(kIdInfoMic, "Microphone: " + app.mic_label.value_or("default"), false));
     items.push_back(make_item(kIdInfoTuning,
-                              "Tuning: Duck " + std::to_string(settings.duck_percent) + "%, Sens " +
-                                  format_double(settings.vad_threshold, 4) + ", Hold " +
-                                  std::to_string(settings.hold_ms) + "ms, Return " +
+                              "Tuning: Duck " + std::to_string(settings.duck_percent) +
+                                  "%, Call sens " + format_double(settings.vad_threshold, 4) +
+                                  ", Mic sens " + format_double(settings.mic_vad_threshold, 4) +
+                                  ", Hold " + std::to_string(settings.hold_ms) + "ms, Return " +
                                   std::to_string(settings.release_fade_ms) + "ms",
                               false));
     items.push_back(make_item(kIdToggle, "Ducking", app.can_toggle(), app.visible_state()));
@@ -502,23 +619,52 @@ GVariant* build_root_layout(TrayApp& app) {
     return make_item(0, "", true, std::nullopt, make_children(items));
 }
 
+GVariant* find_item(GVariant* item, int wanted) {
+    int32_t id = 0;
+    GVariant* props = nullptr;
+    GVariant* children = nullptr;
+    g_variant_get(item, "(i@a{sv}@av)", &id, &props, &children);
+    if (id == wanted) {
+        g_variant_unref(children);
+        g_variant_unref(props);
+        return g_variant_ref(item);
+    }
+
+    GVariantIter iterator;
+    g_variant_iter_init(&iterator, children);
+    GVariant* child = nullptr;
+    while ((child = g_variant_iter_next_value(&iterator)) != nullptr) {
+        GVariant* nested = nullptr;
+        g_variant_get(child, "v", &nested);
+        g_variant_unref(child);
+        if (nested == nullptr) {
+            continue;
+        }
+        GVariant* found = find_item(nested, wanted);
+        g_variant_unref(nested);
+        if (found != nullptr) {
+            g_variant_unref(children);
+            g_variant_unref(props);
+            return found;
+        }
+    }
+    g_variant_unref(children);
+    g_variant_unref(props);
+    return nullptr;
+}
+
 GVariant* build_submenu_layout(TrayApp& app, int parent) {
-    (void)app;
-    Config config;
-    try {
-        config = Config::load_or_default();
-    } catch (const std::exception&) {
-        config = Config::defaults();
+    // The root layout contains every submenu, including per-application and
+    // per-device groups. Return the requested subtree so hosts that fetch
+    // submenus lazily see the same grouped children.
+    GVariant* root = build_root_layout(app);
+    GVariant* found = find_item(root, parent);
+    g_variant_unref(root);
+    if (found != nullptr) {
+        return found;
     }
-    std::vector<GVariant*> items;
-    if (parent == kIdTriggerMenu) {
-        items = trigger_children(config);
-    } else if (parent == kIdSourceMenu) {
-        items = source_children();
-    } else if (parent == kIdMicMenu) {
-        items = mic_children(config);
-    }
-    return make_item(parent, "", true, std::nullopt, make_children(items));
+    std::vector<GVariant*> empty;
+    return make_item(parent, "", true, std::nullopt, make_children(empty));
 }
 
 GVariant* find_props_in_children(GVariant* children, int wanted);
@@ -886,6 +1032,29 @@ void TrayApp::notify_changed() {
                                   g_variant_new("(ui)", menu_revision, 0), nullptr);
 }
 
+void TrayApp::poll_external_state() {
+    bool changed = false;
+
+    const uint64_t revision = PulseCtl::cache_revision();
+    if (revision != last_cache_revision) {
+        last_cache_revision = revision;
+        changed = true;
+    }
+
+    std::error_code error;
+    const auto mtime = std::filesystem::last_write_time(config_path(), error);
+    if (!error && (!last_config_mtime.has_value() || *last_config_mtime != mtime)) {
+        last_config_mtime = mtime;
+        source_label = config_source_label();
+        mic_label = config_mic_label();
+        changed = true;
+    }
+
+    if (changed) {
+        notify_changed();
+    }
+}
+
 void TrayApp::register_with_watcher() {
     if (bus == nullptr) {
         return;
@@ -1004,9 +1173,10 @@ void handle_menu_event(TrayApp& app, int id) {
         app.request_quit();
     } else if (id >= kIdSourceBase && id < kIdMicBase) {
         app.select_source(static_cast<uint32_t>(id - kIdSourceBase));
-    } else if (id >= kIdMicBase) {
+    } else if (id >= kIdMicBase && id < kIdSourceGroupBase) {
         app.select_mic(static_cast<uint32_t>(id - kIdMicBase));
     }
+    // Group items (kIdSourceGroupBase..) are submenu parents and have no action.
 }
 
 void handle_menu_method_call(GDBusConnection*, const gchar*, const gchar*, const gchar*,
@@ -1239,7 +1409,22 @@ int run_tray(const TrayOptions& options) {
     app.lock_fd = lock_fd;
     app.source_label = config_source_label();
     app.mic_label = config_mic_label();
+    app.last_cache_revision = PulseCtl::cache_revision();
+    {
+        std::error_code error;
+        const auto mtime = std::filesystem::last_write_time(config_path(), error);
+        if (!error) {
+            app.last_config_mtime = mtime;
+        }
+    }
     app.loop = g_main_loop_new(nullptr, FALSE);
+    app.refresh_timer = g_timeout_add(
+        400,
+        [](gpointer data) -> gboolean {
+            static_cast<TrayApp*>(data)->poll_external_state();
+            return G_SOURCE_CONTINUE;
+        },
+        &app);
 
     GError* error = nullptr;
     app.bus = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &error);

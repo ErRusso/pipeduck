@@ -28,6 +28,7 @@ struct CliOptions {
     Command command = Command::Tray;
     std::optional<int> duck_percent;
     std::optional<double> vad_threshold;
+    std::optional<double> mic_vad_threshold;
     std::optional<int> hold_ms;
     std::optional<int> fade_ms;
     std::optional<Trigger> trigger;

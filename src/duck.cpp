@@ -21,6 +21,7 @@ constexpr auto kWaitingPoll = std::chrono::milliseconds(500);
 constexpr auto kTickInterval = std::chrono::milliseconds(25);
 constexpr auto kSourceCheckInterval = std::chrono::milliseconds(500);
 constexpr auto kRouteRefreshInterval = std::chrono::milliseconds(500);
+constexpr auto kSinkCheckInterval = std::chrono::milliseconds(500);
 constexpr auto kConfigReloadInterval = std::chrono::milliseconds(250);
 constexpr auto kVadAttack = std::chrono::milliseconds(40);
 
@@ -120,7 +121,7 @@ std::string capture_label(const std::optional<CallTarget>& call,
     return label;
 }
 
-enum class SessionEnd { StopRequested, SourceChanged, RoutingFailed };
+enum class SessionEnd { StopRequested, SourceChanged, SinkChanged, RoutingFailed };
 
 } // namespace
 
@@ -128,6 +129,7 @@ DuckingSettings DuckingSettings::normalized() const {
     DuckingSettings result = *this;
     result.duck_percent = std::clamp(result.duck_percent, 0, 100);
     result.vad_threshold = std::clamp(result.vad_threshold, 0.0025, 0.2);
+    result.mic_vad_threshold = std::clamp(result.mic_vad_threshold, 0.0025, 0.2);
     result.hold_ms = std::clamp(result.hold_ms, 0, 4000);
     result.attack_fade_ms = std::clamp(result.attack_fade_ms, 0, 2000);
     result.release_fade_ms = std::clamp(result.release_fade_ms, 0, 3000);
@@ -138,6 +140,7 @@ DuckingSettings DuckingSettings::from_config(const Config& config) {
     DuckingSettings settings;
     settings.duck_percent = config.duck_percent;
     settings.vad_threshold = config.vad_threshold;
+    settings.mic_vad_threshold = config.mic_vad_threshold.value_or(config.vad_threshold);
     settings.hold_ms = config.hold_ms;
     settings.attack_fade_ms = config.attack_fade_ms;
     settings.release_fade_ms = config.release_fade_ms;
@@ -149,6 +152,7 @@ void DuckingSettings::apply_to(Config& config) const {
     const DuckingSettings settings = normalized();
     config.duck_percent = settings.duck_percent;
     config.vad_threshold = settings.vad_threshold;
+    config.mic_vad_threshold = settings.mic_vad_threshold;
     config.hold_ms = settings.hold_ms;
     config.attack_fade_ms = settings.attack_fade_ms;
     config.release_fade_ms = settings.release_fade_ms;
@@ -317,6 +321,8 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
             event.label = label;
             event.threshold = current.vad_threshold;
             event.start_threshold = vad_start_threshold(current.vad_threshold);
+            event.mic_threshold = current.mic_vad_threshold;
+            event.mic_start_threshold = vad_start_threshold(current.mic_vad_threshold);
             event.hold_ms = current.hold_ms;
             on_event(event);
         }
@@ -329,6 +335,7 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
         std::optional<int> applied_duck_percent;
         auto next_source_check = std::chrono::steady_clock::now();
         auto next_route_refresh = std::chrono::steady_clock::now();
+        auto next_sink_check = std::chrono::steady_clock::now();
         auto next_config_reload = std::chrono::steady_clock::now();
         SessionEnd end = SessionEnd::StopRequested;
 
@@ -380,6 +387,19 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
                 next_route_refresh = now + kRouteRefreshInterval;
             }
 
+            if (now >= next_sink_check) {
+                try {
+                    const std::string default_sink = PulseCtl{}.default_sink_name();
+                    if (!default_sink.empty() && default_sink != session->real_sink_name() &&
+                        default_sink != session->virtual_sink_name()) {
+                        end = SessionEnd::SinkChanged;
+                        break;
+                    }
+                } catch (const std::exception&) {
+                }
+                next_sink_check = now + kSinkCheckInterval;
+            }
+
             const DuckingSettings active_settings = settings.get();
             bool voice_active = false;
             double level = 0.0;
@@ -398,7 +418,7 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
                 const uint64_t frames = mic_monitor->frames();
                 const double energy = frames == last_mic_frames ? 0.0 : mic_monitor->energy();
                 last_mic_frames = frames;
-                if (mic_vad.step(energy, active_settings.vad_threshold, kVadAttack,
+                if (mic_vad.step(energy, active_settings.mic_vad_threshold, kVadAttack,
                                  std::chrono::milliseconds(active_settings.hold_ms))) {
                     voice_active = true;
                 }
@@ -407,8 +427,10 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
 
             if (voice_active != ducked) {
                 if (voice_active) {
-                    session->ramp_to(active_settings.duck_percent, active_settings.attack_fade_ms,
-                                     &stop);
+                    // Cancel any release fade in progress and fade down from the
+                    // volume we are at right now, not from 100%.
+                    session->start_ramp(active_settings.duck_percent,
+                                        active_settings.attack_fade_ms);
                     applied_duck_percent = active_settings.duck_percent;
                     DuckingEvent event;
                     event.type = DuckingEventType::VoiceActive;
@@ -416,7 +438,7 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
                     event.duck_percent = active_settings.duck_percent;
                     on_event(event);
                 } else {
-                    session->ramp_to(100.0, active_settings.release_fade_ms, &stop);
+                    session->start_ramp(100.0, active_settings.release_fade_ms);
                     applied_duck_percent.reset();
                     DuckingEvent event;
                     event.type = DuckingEventType::VoiceInactive;
@@ -425,8 +447,7 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
                 }
                 ducked = voice_active;
             } else if (ducked && applied_duck_percent != active_settings.duck_percent) {
-                session->ramp_to(active_settings.duck_percent, active_settings.attack_fade_ms,
-                                 &stop);
+                session->start_ramp(active_settings.duck_percent, active_settings.attack_fade_ms);
                 applied_duck_percent = active_settings.duck_percent;
                 DuckingEvent event;
                 event.type = DuckingEventType::VoiceActive;
@@ -434,6 +455,10 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
                 event.duck_percent = active_settings.duck_percent;
                 on_event(event);
             }
+
+            // Drive the fade from the control tick instead of sleeping inside
+            // it. This keeps VAD sampling alive during attack and release.
+            session->tick_ramp();
 
             std::this_thread::sleep_for(kTickInterval);
         }

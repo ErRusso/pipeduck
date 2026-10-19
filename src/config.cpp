@@ -186,6 +186,9 @@ Config Config::normalized() const {
     Config result = *this;
     result.duck_percent = std::clamp(result.duck_percent, 0, 100);
     result.vad_threshold = std::clamp(result.vad_threshold, 0.0025, 0.2);
+    if (result.mic_vad_threshold.has_value()) {
+        result.mic_vad_threshold = std::clamp(*result.mic_vad_threshold, 0.0025, 0.2);
+    }
     result.hold_ms = std::clamp(result.hold_ms, 0, 4000);
     result.attack_fade_ms = std::clamp(result.attack_fade_ms, 0, 2000);
     result.release_fade_ms = std::clamp(result.release_fade_ms, 0, 3000);
@@ -247,6 +250,8 @@ std::string Config::serialize(const Config& config) {
            << "# https://github.com/ErRusso/pipeduck\n\n"
            << "duck_percent = " << config.duck_percent << "\n"
            << "vad_threshold = " << format_double(config.vad_threshold, 4) << "\n"
+           << "mic_vad_threshold = "
+           << format_double(config.mic_vad_threshold.value_or(config.vad_threshold), 4) << "\n"
            << "hold_ms = " << config.hold_ms << "\n"
            << "attack_fade_ms = " << config.attack_fade_ms << "\n"
            << "release_fade_ms = " << config.release_fade_ms << "\n"
@@ -326,6 +331,8 @@ Config Config::parse(const std::string& text) {
                 config.duck_percent = parse_int(value, line_number);
             else if (key == "vad_threshold")
                 config.vad_threshold = parse_double(value, line_number);
+            else if (key == "mic_vad_threshold")
+                config.mic_vad_threshold = parse_double(value, line_number);
             else if (key == "hold_ms")
                 config.hold_ms = parse_int(value, line_number);
             else if (key == "attack_fade_ms")

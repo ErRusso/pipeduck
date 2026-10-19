@@ -12,6 +12,7 @@ namespace pipeduck {
 struct DuckingSettings {
     int duck_percent = 25;
     double vad_threshold = 0.01;
+    double mic_vad_threshold = 0.01;
     int hold_ms = 700;
     int attack_fade_ms = 80;
     int release_fade_ms = 320;
@@ -48,6 +49,8 @@ struct DuckingEvent {
     double level = 0.0;
     double threshold = 0.0;
     double start_threshold = 0.0;
+    double mic_threshold = 0.0;
+    double mic_start_threshold = 0.0;
     int hold_ms = 0;
     int duck_percent = 0;
 };

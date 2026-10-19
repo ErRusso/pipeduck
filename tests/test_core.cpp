@@ -124,6 +124,19 @@ media_class = "Stream/Output/Audio"
     CHECK(legacy_config.trigger == pipeduck::Trigger::Call);
     CHECK(legacy_config.release_fade_ms == 320);
     CHECK(legacy_config.voice_source.has_value());
+    CHECK(!legacy_config.mic_vad_threshold.has_value());
+    CHECK(std::abs(pipeduck::DuckingSettings::from_config(legacy_config).mic_vad_threshold -
+                   legacy_config.vad_threshold) < 1e-9);
+
+    const pipeduck::Config mic_thresholds = pipeduck::Config::parse(R"(
+vad_threshold = 0.0100
+mic_vad_threshold = 0.0250
+)");
+    CHECK(mic_thresholds.mic_vad_threshold.has_value());
+    CHECK(std::abs(*mic_thresholds.mic_vad_threshold - 0.025) < 1e-9);
+    const auto mic_settings = pipeduck::DuckingSettings::from_config(mic_thresholds);
+    CHECK(std::abs(mic_settings.mic_vad_threshold - 0.025) < 1e-9);
+    CHECK(mic_settings.vad_threshold != mic_settings.mic_vad_threshold);
 
     CHECK(pipeduck::parse_trigger("MIC") == pipeduck::Trigger::Mic);
     CHECK(pipeduck::parse_trigger("call+mic") == pipeduck::Trigger::Both);
@@ -132,13 +145,21 @@ media_class = "Stream/Output/Audio"
     pipeduck::Config clamped = config;
     clamped.duck_percent = 400;
     clamped.vad_threshold = 99.0;
+    clamped.mic_vad_threshold = -1.0;
     clamped.hold_ms = -3;
     clamped.release_fade_ms = 99999;
     const auto normalized = clamped.normalized();
     CHECK(normalized.duck_percent == 100);
     CHECK(std::abs(normalized.vad_threshold - 0.2) < 1e-9);
+    CHECK(std::abs(*normalized.mic_vad_threshold - 0.0025) < 1e-9);
     CHECK(normalized.hold_ms == 0);
     CHECK(normalized.release_fade_ms == 3000);
+
+    const std::string serialized_thresholds = pipeduck::Config::serialize(mic_thresholds);
+    CHECK(serialized_thresholds.find("mic_vad_threshold = 0.0250") != std::string::npos);
+    const auto threshold_roundtrip = pipeduck::Config::parse(serialized_thresholds);
+    CHECK(threshold_roundtrip.mic_vad_threshold.has_value());
+    CHECK(std::abs(*threshold_roundtrip.mic_vad_threshold - 0.025) < 1e-9);
 }
 
 void test_config_file_roundtrip() {
@@ -339,16 +360,49 @@ void test_ramp() {
     CHECK(std::abs(immediate[0] - 25.0) < 1e-9);
 }
 
+void test_nonblocking_ramp() {
+    g_current_test = "nonblocking-ramp";
+    using namespace std::chrono_literals;
+    using Clock = pipeduck::VolumeRamp::Clock;
+
+    const auto start_time = Clock::now();
+    pipeduck::VolumeRamp ramp;
+    ramp.start(100.0, 25.0, 1000, start_time);
+    CHECK(ramp.active());
+    CHECK(std::abs(ramp.current() - 100.0) < 1e-9);
+    CHECK(std::abs(ramp.update(start_time + 500ms) - 62.5) < 1e-6);
+
+    // A release fade can be interrupted and restarted from the current volume.
+    const double interrupted = ramp.update(start_time + 700ms);
+    CHECK(interrupted < 100.0 && interrupted > 25.0);
+    ramp.start(interrupted, 25.0, 1000, start_time + 700ms);
+    CHECK(ramp.active());
+    const double shortly_after = ramp.update(start_time + 750ms);
+    CHECK(shortly_after <= interrupted + 1e-9);
+    CHECK(shortly_after >= 25.0);
+    const double after = ramp.update(start_time + 800ms);
+    CHECK(after <= shortly_after + 1e-9);
+    CHECK(std::abs(ramp.update(start_time + 1800ms) - 25.0) < 1e-9);
+    CHECK(!ramp.active());
+
+    pipeduck::VolumeRamp immediate;
+    immediate.start(100.0, 25.0, 0, start_time);
+    CHECK(!immediate.active());
+    CHECK(std::abs(immediate.current() - 25.0) < 1e-9);
+}
+
 void test_settings() {
     g_current_test = "settings";
     pipeduck::DuckingSettings settings;
     settings.duck_percent = 140;
     settings.vad_threshold = 0.0;
+    settings.mic_vad_threshold = 0.5;
     settings.hold_ms = 9000;
     settings.release_fade_ms = 5000;
     const auto normalized = settings.normalized();
     CHECK(normalized.duck_percent == 100);
     CHECK(std::abs(normalized.vad_threshold - 0.0025) < 1e-9);
+    CHECK(std::abs(normalized.mic_vad_threshold - 0.2) < 1e-9);
     CHECK(normalized.hold_ms == 4000);
     CHECK(normalized.release_fade_ms == 3000);
 
@@ -367,6 +421,7 @@ int main() {
     test_routing_ports();
     test_pulse_json();
     test_ramp();
+    test_nonblocking_ramp();
     test_settings();
 
     if (g_failures != 0) {

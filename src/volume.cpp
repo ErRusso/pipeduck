@@ -141,6 +141,44 @@ double smoothstep(double value) {
     return clamped * clamped * (3.0 - 2.0 * clamped);
 }
 
+void VolumeRamp::start(double from_percent, double to_percent, int duration_ms,
+                       Clock::time_point now) {
+    start_ = std::clamp(from_percent, 0.0, 150.0);
+    target_ = std::clamp(to_percent, 0.0, 150.0);
+    current_ = start_;
+    duration_ms_ = std::max(duration_ms, 0);
+    started_ = now;
+    active_ = duration_ms_ > 0 && std::abs(target_ - start_) >= 0.01;
+    if (!active_) {
+        current_ = target_;
+    }
+}
+
+double VolumeRamp::update(Clock::time_point now) {
+    if (!active_) {
+        return current_;
+    }
+    if (duration_ms_ <= 0) {
+        current_ = target_;
+        active_ = false;
+        return current_;
+    }
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - started_).count();
+    const double progress =
+        std::clamp(static_cast<double>(elapsed) / static_cast<double>(duration_ms_), 0.0, 1.0);
+    current_ = start_ + (target_ - start_) * smoothstep(progress);
+    if (progress >= 1.0) {
+        current_ = target_;
+        active_ = false;
+    }
+    return current_;
+}
+
+void VolumeRamp::cancel() {
+    active_ = false;
+}
+
 void run_volume_ramp(double from_percent, double to_percent, int duration_ms, int step_ms,
                      const std::atomic<bool>* stop, const std::function<void(double)>& apply) {
     if (!apply) {

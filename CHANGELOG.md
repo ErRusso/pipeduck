@@ -4,6 +4,31 @@ All notable changes to PipeDuck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-10-19
+
+### Added
+
+- Group playback streams by application and microphones by device in the tray menus.
+- Refresh the source and microphone menus automatically when streams, microphones or the
+  configuration change.
+- Separate `mic_vad_threshold` setting, CLI override and tuner row for microphone-triggered
+  ducking.
+- DBusMenu/StatusNotifierItem integration test that runs under `dbus-run-session`.
+
+### Changed
+
+- PulseAudio/PipeWire state is read from a single libpulse event subscription instead of polling
+  `pactl`, so the ducking loop and tray menus no longer spawn processes in steady state.
+- Volume fades are non-blocking and driven by the control tick. Speech during a return fade now
+  cancels it and fades down from the current volume.
+- Ducking follows default-output changes while active.
+
+### Fixed
+
+- Stopping ducking no longer overwrites a default sink change made by the user while it was
+  running.
+- Microphone sensitivity can be tuned independently from call sensitivity.
+
 ## [1.0.0] - 2026-10-19
 
 ### Added

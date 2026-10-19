@@ -39,6 +39,11 @@ public:
 
     // Immediately set the virtual monitor volume in percent.
     void set_percent(double percent);
+    // Start a non-blocking smoothstep fade. Call tick_ramp() from the control loop.
+    void start_ramp(double percent, int duration_ms);
+    // Advance the active fade to the current time. Safe to call when idle.
+    void tick_ramp();
+    bool ramp_active() const;
     // Fade smoothly to `percent`. Blocks for at most duration_ms.
     void ramp_to(double percent, int duration_ms, const std::atomic<bool>* stop = nullptr);
     void set_neutral(int fade_ms = 0);

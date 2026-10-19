@@ -64,8 +64,18 @@ Commit the generated assets together with the master. CMake embeds the ARGB pixm
 
 ## Integration testing
 
-The unit suite does not require an audio server. To test against a live PipeWire session safely,
-create an isolated null sink instead of using your real output:
+The unit suite does not require an audio server. The tray integration test runs the real tray
+binary on a private session bus and checks the StatusNotifierItem/DBusMenu contract (signatures,
+root item, `AboutToShow`, `GetGroupProperties` and click handling):
+
+```bash
+dbus-run-session -- build/pipeduck_tray_tests build/pipeduck
+# ctest runs it automatically when dbus-run-session is installed:
+ctest --test-dir build --output-on-failure
+```
+
+To test against a live PipeWire session safely, create an isolated null sink instead of using your
+real output:
 
 ```bash
 pactl load-module module-null-sink sink_name=pipeduck-itest \
@@ -79,8 +89,11 @@ Test the following before a routing change:
 1. The selected call stream is excluded and stays on its original sink.
 2. Other streams move to the `pipeduck-*` sink.
 3. Speech activity ducks and idle speech restores volume smoothly.
-4. Stopping the process restores every stream to its original sink.
+4. Stopping the process restores every stream to its original sink and leaves a default-sink switch
+   made during the session intact.
 5. Killing a playback client does not crash the ducking worker.
+6. With `release_fade_ms` set to 1500-3000 and the `mic` trigger, speak again during the return
+   fade. The volume must start decreasing from its current value instead of continuing to rise.
 
 ## Pull requests
 

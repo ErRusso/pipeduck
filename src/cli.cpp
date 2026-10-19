@@ -66,6 +66,11 @@ CliOptions parse_cli(int argc, char** argv) {
                 parse_double_arg(need_value(argc, argv, index, argument), argument);
             continue;
         }
+        if (argument == "--mic-vad-threshold") {
+            options.mic_vad_threshold =
+                parse_double_arg(need_value(argc, argv, index, argument), argument);
+            continue;
+        }
         if (argument == "--hold-ms") {
             options.hold_ms = parse_int_arg(need_value(argc, argv, index, argument), argument);
             continue;
@@ -167,7 +172,8 @@ Commands:
 
 Options:
   --duck-percent N     Volume for non-call audio while ducking (0-100)
-  --vad-threshold F    Base RMS threshold; voice starts above about 2x this value
+  --vad-threshold F    Base RMS threshold for call audio
+  --mic-vad-threshold F  Base RMS threshold for the microphone (defaults to --vad-threshold)
   --hold-ms N          Keep ducking active for N ms after speech stops
   --fade-ms N          Smooth return time in ms (overrides release_fade_ms)
   --trigger MODE       call, mic or both

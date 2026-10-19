@@ -22,12 +22,14 @@ constexpr double kThresholdMax = 0.2;
 
 struct TunerContext {
     GtkWidget* sensitivity = nullptr;
+    GtkWidget* mic_sensitivity = nullptr;
     GtkWidget* duck = nullptr;
     GtkWidget* hold = nullptr;
     GtkWidget* attack_fade = nullptr;
     GtkWidget* release_fade = nullptr;
     GtkWidget* trigger = nullptr;
     GtkWidget* sensitivity_value = nullptr;
+    GtkWidget* mic_sensitivity_value = nullptr;
     GtkWidget* duck_value = nullptr;
     GtkWidget* hold_value = nullptr;
     GtkWidget* attack_value = nullptr;
@@ -65,6 +67,7 @@ std::string sensitivity_label(double threshold) {
 DuckingSettings settings_from_widgets(TunerContext& context) {
     DuckingSettings settings;
     settings.vad_threshold = threshold_from_percent(scale_value(context.sensitivity));
+    settings.mic_vad_threshold = threshold_from_percent(scale_value(context.mic_sensitivity));
     settings.duck_percent = static_cast<int>(std::lround(scale_value(context.duck)));
     settings.hold_ms = static_cast<int>(std::lround(scale_value(context.hold) / 50.0) * 50);
     settings.attack_fade_ms =
@@ -81,6 +84,8 @@ DuckingSettings settings_from_widgets(TunerContext& context) {
 void refresh_labels(TunerContext& context, const DuckingSettings& settings) {
     gtk_label_set_text(GTK_LABEL(context.sensitivity_value),
                        sensitivity_label(settings.vad_threshold).c_str());
+    gtk_label_set_text(GTK_LABEL(context.mic_sensitivity_value),
+                       sensitivity_label(settings.mic_vad_threshold).c_str());
     const std::string duck = std::to_string(settings.duck_percent) + "%";
     gtk_label_set_text(GTK_LABEL(context.duck_value), duck.c_str());
     const std::string hold = std::to_string(settings.hold_ms) + " ms";
@@ -172,7 +177,7 @@ int run_gui_tuner() {
 
     GtkWidget* window = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(window), "pipeduck Tuner");
-    gtk_window_set_default_size(GTK_WINDOW(window), 560, 480);
+    gtk_window_set_default_size(GTK_WINDOW(window), 560, 560);
     gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
 
     GtkWidget* root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
@@ -189,9 +194,14 @@ int run_gui_tuner() {
 
     TunerContext context;
     gtk_box_append(GTK_BOX(root),
-                   append_slider_row(root, "Sensitivity", "0% = off, 100% = very sensitive",
+                   append_slider_row(root, "Sensitivity (call)", "0% = off, 100% = very sensitive",
                                      sensitivity_percent(settings.vad_threshold), 0, 100, 1,
                                      &context.sensitivity, &context.sensitivity_value));
+    gtk_box_append(GTK_BOX(root),
+                   append_slider_row(root, "Microphone sensitivity",
+                                     "Separate threshold for microphone-triggered ducking",
+                                     sensitivity_percent(settings.mic_vad_threshold), 0, 100, 1,
+                                     &context.mic_sensitivity, &context.mic_sensitivity_value));
     gtk_box_append(GTK_BOX(root),
                    append_slider_row(root, "Ducking volume", "Target volume while speech is active",
                                      settings.duck_percent, 0, 100, 1, &context.duck,
@@ -247,8 +257,8 @@ int run_gui_tuner() {
     gtk_box_append(GTK_BOX(root), path_label);
 
     context.updating = true;
-    for (GtkWidget* scale : {context.sensitivity, context.duck, context.hold, context.attack_fade,
-                             context.release_fade}) {
+    for (GtkWidget* scale : {context.sensitivity, context.mic_sensitivity, context.duck,
+                             context.hold, context.attack_fade, context.release_fade}) {
         g_signal_connect(scale, "value-changed", G_CALLBACK(on_scale_changed), &context);
     }
     g_signal_connect(trigger, "notify::selected", G_CALLBACK(on_trigger_changed), &context);

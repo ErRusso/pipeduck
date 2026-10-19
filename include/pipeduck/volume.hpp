@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -26,6 +27,37 @@ private:
 };
 
 double smoothstep(double value);
+
+// A non-blocking smoothstep fade. Callers drive it from their own control tick
+// with update(), which makes it possible to interrupt a release fade as soon as
+// speech is detected again.
+class VolumeRamp {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    void start(double from_percent, double to_percent, int duration_ms,
+               Clock::time_point now = Clock::now());
+    double update(Clock::time_point now = Clock::now());
+    void cancel();
+
+    bool active() const {
+        return active_;
+    }
+    double current() const {
+        return current_;
+    }
+    double target() const {
+        return target_;
+    }
+
+private:
+    double start_ = 100.0;
+    double target_ = 100.0;
+    double current_ = 100.0;
+    int duration_ms_ = 0;
+    Clock::time_point started_{};
+    bool active_ = false;
+};
 
 // Calls `apply` for every step of a smoothstep fade, sleeping step_ms between
 // steps. The final value is always applied.

@@ -1,4 +1,4 @@
-.TH PIPEDUCK 1 "October 2026" "pipeduck 1.0.0" "User Commands"
+.TH PIPEDUCK 1 "October 2026" "pipeduck 1.1.0" "User Commands"
 .SH NAME
 pipeduck \- automatic audio ducking for PipeWire
 .SH SYNOPSIS
@@ -57,7 +57,11 @@ Create a default configuration if none exists.
 Volume for non-call audio while speech is active (0-100).
 .TP
 .BI "\-\-vad\-threshold " F
-Base RMS threshold. Speech starts above about twice this value.
+Base RMS threshold for call audio. Speech starts above about twice this value.
+.TP
+.BI "\-\-mic\-vad\-threshold " F
+Base RMS threshold for microphone-triggered ducking. Defaults to the value of
+\fB\-\-vad\-threshold\fR.
 .TP
 .BI "\-\-hold\-ms " N
 Keep ducking active for N milliseconds after speech stops.

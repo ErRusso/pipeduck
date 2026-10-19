@@ -25,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake pkg-config libpipewire-0.3-dev libpulse-dev libjson-c-dev \
+            cmake pkg-config dbus libpipewire-0.3-dev libpulse-dev libjson-c-dev \
             libglib2.0-dev libgtk-4-dev libncurses-dev
 
       - name: Configure

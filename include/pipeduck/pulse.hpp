@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -39,6 +40,47 @@ std::vector<Sink> parse_sinks_json(const std::string& raw);
 std::vector<SinkInput> parse_sink_inputs_json(const std::string& raw);
 std::vector<Source> parse_sources_json(const std::string& raw);
 
+// A process-wide, subscription-driven cache of the PulseAudio/PipeWire graph.
+// The cache is refreshed from libpulse events instead of spawning `pactl`, so
+// snapshots are cheap enough to use from the tray's D-Bus thread and from the
+// ducking control loop. If libpulse is unavailable, PulseCtl falls back to
+// `pactl` and this cache simply reports unavailable().
+class PulseCache {
+public:
+    static PulseCache& shared();
+    ~PulseCache();
+    PulseCache(const PulseCache&) = delete;
+    PulseCache& operator=(const PulseCache&) = delete;
+
+    bool available() const;
+    // Increases whenever the cached graph changes.
+    uint64_t revision() const;
+
+    std::string default_sink_name() const;
+    std::string default_source_name() const;
+
+    std::vector<Sink> sinks() const;
+    std::optional<Sink> sink_by_name(const std::string& name) const;
+    std::optional<Sink> sink_by_index(uint32_t index) const;
+
+    std::vector<SinkInput> sink_inputs() const;
+    std::vector<SinkInput> sink_inputs_on_sink(uint32_t sink_index) const;
+
+    std::vector<Source> sources() const;
+    std::optional<Source> source_by_name(const std::string& name) const;
+    std::optional<Source> source_by_index(uint32_t index) const;
+
+    bool move_sink_input(uint32_t input_index, const std::string& sink_name) const;
+    bool move_sink_input_to_index(uint32_t input_index, uint32_t sink_index) const;
+    bool set_default_sink(const std::string& sink_name) const;
+    bool set_source_volume_percent(const std::string& source_name, double percent) const;
+
+private:
+    PulseCache();
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 class PulseCtl {
 public:
     std::string default_sink_name() const;
@@ -60,6 +102,9 @@ public:
     void move_sink_input(uint32_t input_index, const std::string& sink_name) const;
     void move_sink_input_to_index(uint32_t input_index, uint32_t sink_index) const;
     void set_source_volume_percent(const std::string& source_name, double percent) const;
+
+    // Revision of the event-driven graph cache, or 0 when libpulse is unavailable.
+    static uint64_t cache_revision();
 
 private:
     static constexpr std::chrono::milliseconds kTimeout{5000};

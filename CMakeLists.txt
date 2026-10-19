@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(pipeduck
-    VERSION 1.0.0
+    VERSION 1.1.0
     DESCRIPTION "Automatic audio ducking for PipeWire, controlled from the system tray"
     HOMEPAGE_URL "https://github.com/ErRusso/pipeduck"
     LANGUAGES CXX)
@@ -102,6 +102,19 @@ if(PIPEDUCK_BUILD_TESTS)
     target_link_libraries(pipeduck_tests PRIVATE pipeduck_core)
     target_compile_options(pipeduck_tests PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME pipeduck_tests COMMAND pipeduck_tests)
+
+    find_program(DBUS_RUN_SESSION_EXECUTABLE dbus-run-session)
+    if(DBUS_RUN_SESSION_EXECUTABLE)
+        add_executable(pipeduck_tray_tests tests/test_tray.cpp)
+        add_dependencies(pipeduck_tray_tests pipeduck)
+        target_link_libraries(pipeduck_tray_tests PRIVATE pipeduck_core PkgConfig::GIO)
+        target_compile_options(pipeduck_tray_tests PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME pipeduck_tray_tests
+            COMMAND ${DBUS_RUN_SESSION_EXECUTABLE} -- $<TARGET_FILE:pipeduck_tray_tests>
+                    $<TARGET_FILE:pipeduck>)
+    else()
+        message(STATUS "dbus-run-session not found; tray integration test disabled")
+    endif()
 endif()
 
 message(STATUS "pipeduck ${PROJECT_VERSION}")

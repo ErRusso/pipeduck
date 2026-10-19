@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <clocale>
 #include <cstdio>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
@@ -16,9 +17,9 @@
 namespace pipeduck {
 namespace {
 
-enum class Row { Trigger, Sensitivity, DuckPercent, Hold, AttackFade, ReleaseFade };
+enum class Row { Trigger, Sensitivity, MicSensitivity, DuckPercent, Hold, AttackFade, ReleaseFade };
 
-constexpr Row kRows[] = {Row::Trigger, Row::Sensitivity, Row::DuckPercent,
+constexpr Row kRows[] = {Row::Trigger, Row::Sensitivity, Row::MicSensitivity, Row::DuckPercent,
                          Row::Hold,    Row::AttackFade,  Row::ReleaseFade};
 
 class CursesGuard {
@@ -79,6 +80,9 @@ void adjust(DuckingSettings& settings, Row row, int direction) {
     case Row::Sensitivity:
         settings.vad_threshold -= static_cast<double>(direction) * 0.0025;
         break;
+    case Row::MicSensitivity:
+        settings.mic_vad_threshold -= static_cast<double>(direction) * 0.0025;
+        break;
     case Row::DuckPercent:
         settings.duck_percent += direction;
         break;
@@ -102,7 +106,8 @@ void draw(const DuckingSettings& settings, Row selected) {
     mvprintw(3, 0, "Changes are saved immediately and apply live via config.toml");
     mvprintw(5, 0, "Rows:");
 
-    for (int index = 0; index < 6; ++index) {
+    const int row_count = static_cast<int>(std::size(kRows));
+    for (int index = 0; index < row_count; ++index) {
         const Row row = kRows[index];
         std::string label;
         std::string value;
@@ -120,7 +125,7 @@ void draw(const DuckingSettings& settings, Row selected) {
             percent = static_cast<double>(static_cast<int>(settings.trigger)) / 2.0 * 100.0;
             break;
         case Row::Sensitivity:
-            label = "Sensitivity";
+            label = "Sensitivity (call)";
             percent = sensitivity_percent(settings.vad_threshold);
             if (vad_is_disabled(settings.vad_threshold)) {
                 value = "  0%  OFF";
@@ -129,6 +134,19 @@ void draw(const DuckingSettings& settings, Row selected) {
                 std::snprintf(buffer, sizeof(buffer), "%3.0f%%  threshold %.4f, start %.4f",
                               percent, settings.vad_threshold,
                               vad_start_threshold(settings.vad_threshold));
+                value = buffer;
+            }
+            break;
+        case Row::MicSensitivity:
+            label = "Microphone sens.";
+            percent = sensitivity_percent(settings.mic_vad_threshold);
+            if (vad_is_disabled(settings.mic_vad_threshold)) {
+                value = "  0%  OFF";
+            } else {
+                char buffer[128];
+                std::snprintf(buffer, sizeof(buffer), "%3.0f%%  threshold %.4f, start %.4f",
+                              percent, settings.mic_vad_threshold,
+                              vad_start_threshold(settings.mic_vad_threshold));
                 value = buffer;
             }
             break;
@@ -188,11 +206,12 @@ int run_terminal_tuner() {
             return 0;
         case KEY_UP:
         case 'k':
-            selected = kRows[(static_cast<int>(selected) + 5) % 6];
+            selected = kRows[(static_cast<int>(selected) + static_cast<int>(std::size(kRows)) - 1) %
+                             static_cast<int>(std::size(kRows))];
             break;
         case KEY_DOWN:
         case 'j':
-            selected = kRows[(static_cast<int>(selected) + 1) % 6];
+            selected = kRows[(static_cast<int>(selected) + 1) % static_cast<int>(std::size(kRows))];
             break;
         case KEY_LEFT:
         case 'h':

@@ -25,11 +25,16 @@ UI, terminal and GTK4 tuners, smooth volume ramps and microphone-triggered ducki
   real smoothstep ramp instead of an abrupt jump.
 - **Tray control** — StatusNotifierItem/SNI tray icon with live status, source/mic selection,
   trigger selection, tuning and an on/off switch. Left-click toggles ducking; right-click opens
-  the full configuration menu.
-- **Live tuners** — terminal (`pipeduck tune`) and GTK4 (`pipeduck tune-gui`).
+  the full configuration menu. Playback streams are grouped by application and microphones by
+  device, and the menus refresh automatically as streams appear or disappear.
+- **Live tuners** — terminal (`pipeduck tune`) and GTK4 (`pipeduck tune-gui`), with separate
+  sensitivity for call audio and the microphone.
 - **Config hot reload** — changes from either tuner apply to a running tray immediately.
+- **Event-driven** — one libpulse subscription keeps the stream list current without polling
+  `pactl`; fades run on the control tick, so new speech interrupts a return fade immediately.
 - **Safe routing** — temporary virtual sink, automatic stream restore, and a safety fallback that
-  leaves the sink alive rather than terminating application audio.
+  leaves the sink alive rather than terminating application audio. Ducking follows default-output
+  changes and never overwrites the user's default sink when it stops.
 - **Single instance** — a second tray instance refuses to start.
 - **CLI** — status, stream discovery, source/mic selection and diagnostic routing.
 
@@ -128,7 +133,8 @@ pipeduck select-source 546
 
 ```text
 --duck-percent N     volume for other audio while speech is active (0-100)
---vad-threshold F    base RMS threshold; speech starts above roughly 2x this value
+--vad-threshold F    base RMS threshold for call audio; speech starts above roughly 2x this value
+--mic-vad-threshold F  base RMS threshold for the microphone (defaults to --vad-threshold)
 --hold-ms N          stay ducked for N ms after speech stops
 --fade-ms N          smooth return time in ms (overrides release_fade_ms)
 --trigger MODE       call, mic or both
@@ -147,6 +153,7 @@ Example:
 ```toml
 duck_percent = 25
 vad_threshold = 0.0100
+mic_vad_threshold = 0.0250
 hold_ms = 700
 attack_fade_ms = 80
 release_fade_ms = 320
@@ -167,12 +174,13 @@ label = "USB Microphone"
 | Key | Meaning |
 | --- | --- |
 | `duck_percent` | Target volume for non-call audio while speech is active. |
-| `vad_threshold` | Base RMS threshold. `0.0025` is very sensitive, `0.2` disables detection. Speech has to exceed about twice this value to start and 0.75x to stay active. |
+| `vad_threshold` | Base RMS threshold for call audio. `0.0025` is very sensitive, `0.2` disables detection. Speech has to exceed about twice this value to start and 0.75x to stay active. |
+| `mic_vad_threshold` | Optional microphone-specific RMS threshold. When omitted or unset, `vad_threshold` is used, so older configs behave exactly as before. |
 | `hold_ms` | How long ducking stays active after speech falls silent. |
 | `attack_fade_ms` | Fade-down duration. `0` disables the fade. |
 | `release_fade_ms` | Fade-back duration. `0` restores volume instantly. **This is the smooth-return control.** |
 | `trigger` | `call`, `mic` or `both`. |
-| `voice_source` | Optional voice-call stream to exclude from ducking. Also selects the sink to route. |
+| `voice_source` | Optional voice-call stream to exclude from ducking. Routing follows the current default output. |
 | `mic_source` | Optional microphone. When unset, the default microphone is used. |
 
 The configuration schema is compatible with pw-duck's `config.toml`; missing new keys receive the
@@ -181,8 +189,11 @@ defaults above.
 ## How it works
 
 While ducking is enabled, PipeDuck creates a temporary `support.null-audio-sink` through PipeWire.
-Its monitor ports are linked to the playback ports of the real sink. Every playback stream on that
-sink — except the configured call stream — is moved to the virtual sink with `pactl`.
+Its monitor ports are linked to the playback ports of the current default sink. Every playback
+stream on that sink — except the configured call stream — is moved to the virtual sink. A single
+libpulse subscription keeps the sink, source and stream lists current, so routing and the tray
+menus react to changes without spawning `pactl`. If the default output changes while ducking is
+active, the session is restarted against the new device.
 
 The selected call stream stays on the real sink and is captured with a PipeWire stream
 (`stream.capture.sink=true`). Microphone mode captures the selected source instead. Both feeds are
@@ -197,16 +208,21 @@ speech active:   100% ──fade down──▶ duck_percent
 speech stops:    duck_percent ──hold──▶ smoothstep ──▶ 100%
 ```
 
-This is what makes the return to the correct volume sound smooth instead of like a jump.
+This is what makes the return to the correct volume sound smooth instead of like a jump. The fade is
+advanced by the control loop rather than blocking it, so speech detected during a return fade
+immediately cancels the upward ramp and fades back down from the current volume.
 
 On shutdown, streams are moved back to their original sinks, monitor links are removed and the
-virtual sink is destroyed. If a stream cannot be moved away safely, the virtual sink is deliberately
-left alive so that active application audio is not terminated.
+virtual sink is destroyed. PipeDuck does not restore the default sink, because the user may have
+switched outputs while ducking was active. If a stream cannot be moved away safely, the virtual sink
+is deliberately left alive so that active application audio is not terminated.
 
 ## Tuning
 
-- **Sensitivity** — how easily speech is detected. `0%` disables detection, `100%` is very
-  sensitive. Internally this maps to the RMS threshold.
+- **Sensitivity (call)** — how easily speech in the call stream is detected. `0%` disables
+  detection, `100%` is very sensitive. Internally this maps to `vad_threshold`.
+- **Microphone sensitivity** — a separate threshold for microphone-triggered ducking, mapped to
+  `mic_vad_threshold`. It falls back to the call sensitivity when unset.
 - **Ducking volume** — volume for non-call audio while speech is active.
 - **Hold** — delay before the return fade starts after speech stops.
 - **Duck fade** — how quickly audio fades down when speech starts.
