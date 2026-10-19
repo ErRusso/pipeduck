@@ -417,10 +417,12 @@ std::vector<GVariant*> source_children() {
             items.push_back(make_item(static_cast<int>(kIdSourceBase + input.index), label));
         }
     } catch (const std::exception& error) {
-        items.push_back(make_item(0, std::string("Cannot read sources: ") + error.what(), false));
+        items.push_back(make_item(static_cast<int>(kIdSourceBase) - 1,
+                                  std::string("Cannot read sources: ") + error.what(), false));
     }
     if (items.empty()) {
-        items.push_back(make_item(0, "No playback streams visible", false));
+        items.push_back(
+            make_item(static_cast<int>(kIdSourceBase) - 1, "No playback streams visible", false));
     }
     return items;
 }
