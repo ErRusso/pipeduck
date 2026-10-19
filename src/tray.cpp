@@ -1120,7 +1120,11 @@ void handle_menu_method_call(GDBusConnection*, const gchar*, const gchar*, const
     }
 
     if (std::strcmp(method_name, "AboutToShow") == 0) {
-        g_dbus_method_invocation_return_value(invocation, g_variant_new("(b)", TRUE));
+        // Return false like ksni/Qt: libdbusmenu ignores the return value and
+        // hosts such as GNOME rebuild the open menu when it is true, which
+        // closes submenus the moment they are opened. Our menu is generated
+        // fresh for every GetLayout call anyway.
+        g_dbus_method_invocation_return_value(invocation, g_variant_new("(b)", FALSE));
         return;
     }
 

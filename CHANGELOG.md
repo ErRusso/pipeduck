@@ -28,6 +28,8 @@ All notable changes to PipeDuck are documented here. The format follows
 - Tray right-click menu implemented as a single DBusMenu root item with the full `(iias)`
   `GetLayout` signature. This matches libdbusmenu/ksni and GNOME's AppIndicator extension, so the
   context menu opens reliably and exposes source, microphone, trigger, tuner and quit controls.
+- `AboutToShow` returns `false` like ksni/Qt. GNOME otherwise rebuilds the whole menu while a
+  submenu is opening, which immediately closed the Trigger and Source submenus.
 
 ### Credits
 
