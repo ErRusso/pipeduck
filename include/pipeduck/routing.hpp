@@ -17,6 +17,9 @@ namespace pipeduck {
 struct RoutingOptions {
     std::string virtual_sink_prefix = "pipeduck";
     std::chrono::milliseconds sink_appear_timeout{2000};
+    std::chrono::milliseconds port_appear_timeout{2000};
+    std::chrono::milliseconds restore_timeout{3000};
+    std::chrono::milliseconds retry_interval{50};
 };
 
 struct PortLink {
@@ -96,6 +99,49 @@ struct RouteCleanupResult {
 // Human-readable one-line diagnostic for a cleanup result.
 std::string describe_cleanup(const RouteCleanupResult& result);
 
+// Minimal seam around the graph operations used by routing. Production code
+// uses make_pulse_routing_backend(); tests provide a local fake instead of
+// touching a live audio server.
+class RoutingSink {
+public:
+    virtual ~RoutingSink() = default;
+    virtual const std::string& name() const = 0;
+    virtual void destroy() = 0;
+    virtual void abandon() = 0;
+};
+
+class RoutingVolume {
+public:
+    virtual ~RoutingVolume() = default;
+    virtual bool set_percent(const std::string& source_name, double percent,
+                             bool allow_subprocess_fallback) = 0;
+};
+
+class RoutingBackend {
+public:
+    virtual ~RoutingBackend() = default;
+
+    virtual std::string default_sink_name() = 0;
+    virtual std::optional<Sink> sink_by_name(const std::string& name) = 0;
+    virtual std::optional<Sink> sink_by_index(uint32_t index) = 0;
+    virtual Sink wait_for_sink(const std::string& name, std::chrono::milliseconds timeout) = 0;
+    virtual std::vector<SinkInput> sink_inputs() = 0;
+    virtual void set_default_sink(const std::string& name) = 0;
+    virtual void move_sink_input(uint32_t input_index, const std::string& sink_name) = 0;
+    virtual void move_sink_input_to_index(uint32_t input_index, uint32_t sink_index) = 0;
+
+    virtual std::unique_ptr<RoutingSink> create_sink(const std::string& prefix) = 0;
+    virtual std::unique_ptr<RoutingVolume> create_volume() = 0;
+
+    virtual std::string list_output_ports() = 0;
+    virtual std::string list_input_ports() = 0;
+    virtual std::string list_links() = 0;
+    virtual void create_link(const PortLink& link) = 0;
+    virtual void remove_link(const PortLink& link) = 0;
+};
+
+std::shared_ptr<RoutingBackend> make_pulse_routing_backend();
+
 class RoutingEngine;
 
 class RouteSession {
@@ -149,7 +195,8 @@ private:
 class RoutingEngine {
 public:
     RoutingEngine(std::optional<ConfiguredSource> voice_source,
-                  std::optional<ConfiguredMic> mic_source = std::nullopt);
+                  std::optional<ConfiguredMic> mic_source = std::nullopt,
+                  std::shared_ptr<RoutingBackend> backend = nullptr);
 
     RouteSession start(const RoutingOptions& options = {});
 
@@ -161,6 +208,7 @@ public:
 private:
     std::optional<ConfiguredSource> voice_source_;
     std::optional<ConfiguredMic> mic_source_;
+    std::shared_ptr<RoutingBackend> backend_;
 };
 
 } // namespace pipeduck

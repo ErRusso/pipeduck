@@ -5,8 +5,12 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +63,240 @@ pipeduck::CliOptions parse_arguments(std::initializer_list<std::string> values) 
         argv.push_back(value.data());
     }
     return pipeduck::parse_cli(static_cast<int>(argv.size()), argv.data());
+}
+
+struct FakeRoutingSink final : pipeduck::RoutingSink {
+    FakeRoutingSink(std::string name, std::function<void()> on_destroy,
+                    std::function<void()> on_abandon)
+        : name_(std::move(name)), on_destroy_(std::move(on_destroy)),
+          on_abandon_(std::move(on_abandon)) {}
+
+    const std::string& name() const override {
+        return name_;
+    }
+    void destroy() override {
+        on_destroy_();
+    }
+    void abandon() override {
+        on_abandon_();
+    }
+
+private:
+    std::string name_;
+    std::function<void()> on_destroy_;
+    std::function<void()> on_abandon_;
+};
+
+struct FakeRoutingVolume final : pipeduck::RoutingVolume {
+    bool set_percent(const std::string&, double, bool) override {
+        ++calls;
+        return result;
+    }
+
+    int calls = 0;
+    bool result = true;
+};
+
+struct FakeRoutingBackend final : pipeduck::RoutingBackend {
+    explicit FakeRoutingBackend(std::string virtual_name = "pipeduck-1")
+        : virtual_sink_name(std::move(virtual_name)) {
+        refresh_port_lists();
+    }
+
+    void refresh_port_lists() {
+        output_ports = virtual_sink_name + ":monitor_FL\n" + virtual_sink_name + ":monitor_FR\n";
+        input_ports = real_sink_name + ":playback_FL\n" + real_sink_name + ":playback_FR\n";
+    }
+
+    std::string links_listing() const {
+        std::string listing;
+        for (const auto& link : links) {
+            listing += link.output + "\n  |-> " + link.input + "\n";
+        }
+        return listing;
+    }
+
+    std::string default_sink_name() override {
+        return real_sink_name;
+    }
+    std::optional<pipeduck::Sink> sink_by_name(const std::string& name) override {
+        if (name == real_sink_name) {
+            return pipeduck::Sink{real_sink_index, real_sink_name, "Real output"};
+        }
+        if (name == virtual_sink_name && sink_present) {
+            return pipeduck::Sink{virtual_sink_index, virtual_sink_name, "Virtual sink"};
+        }
+        return std::nullopt;
+    }
+    std::optional<pipeduck::Sink> sink_by_index(uint32_t index) override {
+        if (index == real_sink_index) {
+            return pipeduck::Sink{real_sink_index, real_sink_name, "Real output"};
+        }
+        if (index == virtual_sink_index && sink_present) {
+            return pipeduck::Sink{virtual_sink_index, virtual_sink_name, "Virtual sink"};
+        }
+        return std::nullopt;
+    }
+    pipeduck::Sink wait_for_sink(const std::string& name, std::chrono::milliseconds) override {
+        ++wait_for_sink_calls;
+        if (!sink_present) {
+            throw std::runtime_error("sink " + name + " did not appear");
+        }
+        return pipeduck::Sink{virtual_sink_index, name, "Virtual sink"};
+    }
+    std::vector<pipeduck::SinkInput> sink_inputs() override {
+        ++sink_input_calls;
+        if (fail_sink_inputs) {
+            throw std::runtime_error("simulated backend unavailable");
+        }
+        return inputs;
+    }
+    void set_default_sink(const std::string& name) override {
+        default_sink_set_to = name;
+    }
+    void move_sink_input(uint32_t input_index, const std::string& sink_name) override {
+        ++move_calls;
+        if (fail_move_to_name_calls > 0) {
+            --fail_move_to_name_calls;
+            throw std::runtime_error("simulated move by name failure");
+        }
+        auto found = find_input(input_index);
+        if (found == nullptr) {
+            throw std::runtime_error("no such sink-input");
+        }
+        if (sink_name == virtual_sink_name) {
+            found->sink = virtual_sink_index;
+        } else if (sink_name == real_sink_name) {
+            found->sink = real_sink_index;
+        } else {
+            throw std::runtime_error("no such sink");
+        }
+    }
+    void move_sink_input_to_index(uint32_t input_index, uint32_t sink_index) override {
+        ++move_calls;
+        if (fail_move_to_index_calls > 0) {
+            --fail_move_to_index_calls;
+            throw std::runtime_error("simulated move by index failure");
+        }
+        auto found = find_input(input_index);
+        if (found == nullptr) {
+            throw std::runtime_error("no such sink-input");
+        }
+        found->sink = sink_index;
+    }
+
+    std::unique_ptr<pipeduck::RoutingSink> create_sink(const std::string&) override {
+        ++create_sink_calls;
+        sink_destroyed = false;
+        sink_abandoned = false;
+        return std::make_unique<FakeRoutingSink>(
+            virtual_sink_name,
+            [this] {
+                sink_destroyed = true;
+                sink_present = false;
+                links.clear();
+            },
+            [this] { sink_abandoned = true; });
+    }
+    std::unique_ptr<pipeduck::RoutingVolume> create_volume() override {
+        ++create_volume_calls;
+        auto volume = std::make_unique<FakeRoutingVolume>();
+        last_volume = volume.get();
+        return volume;
+    }
+
+    std::string list_output_ports() override {
+        return output_ports;
+    }
+    std::string list_input_ports() override {
+        return input_ports;
+    }
+    std::string list_links() override {
+        if (fail_list_links_calls > 0) {
+            --fail_list_links_calls;
+            throw std::runtime_error("simulated pw-link -l failure");
+        }
+        return links_listing();
+    }
+    void create_link(const pipeduck::PortLink& link) override {
+        ++create_link_calls;
+        if (!fail_create_input.empty() && link.input == fail_create_input &&
+            fail_create_input_calls > 0) {
+            --fail_create_input_calls;
+            throw std::runtime_error("simulated pw-link failure for " + link.input);
+        }
+        if (std::find(links.begin(), links.end(), link) != links.end()) {
+            throw std::runtime_error("link already exists: " + link.output + " -> " + link.input);
+        }
+        links.push_back(link);
+    }
+    void remove_link(const pipeduck::PortLink& link) override {
+        ++remove_link_calls;
+        if (fail_remove_link_calls > 0) {
+            --fail_remove_link_calls;
+            throw std::runtime_error("simulated unlink failure");
+        }
+        links.erase(std::remove(links.begin(), links.end(), link), links.end());
+    }
+
+    pipeduck::SinkInput* find_input(uint32_t index) {
+        const auto found = std::find_if(inputs.begin(), inputs.end(), [index](const auto& input) {
+            return input.index == index;
+        });
+        return found == inputs.end() ? nullptr : &*found;
+    }
+
+    std::string real_sink_name = "real";
+    uint32_t real_sink_index = 1;
+    std::string virtual_sink_name;
+    uint32_t virtual_sink_index = 2;
+    bool sink_present = true;
+    bool sink_destroyed = false;
+    bool sink_abandoned = false;
+    bool fail_sink_inputs = false;
+    int fail_list_links_calls = 0;
+    std::string fail_create_input;
+    int fail_create_input_calls = 0;
+    int fail_remove_link_calls = 0;
+    int fail_move_to_index_calls = 0;
+    int fail_move_to_name_calls = 0;
+
+    std::string output_ports;
+    std::string input_ports;
+    std::vector<pipeduck::PortLink> links;
+    std::vector<pipeduck::SinkInput> inputs;
+    std::string default_sink_set_to;
+
+    int wait_for_sink_calls = 0;
+    int sink_input_calls = 0;
+    int move_calls = 0;
+    int create_sink_calls = 0;
+    int create_volume_calls = 0;
+    int create_link_calls = 0;
+    int remove_link_calls = 0;
+    FakeRoutingVolume* last_volume = nullptr;
+};
+
+pipeduck::RoutingOptions fast_routing_options() {
+    pipeduck::RoutingOptions options;
+    options.sink_appear_timeout = std::chrono::milliseconds(0);
+    options.port_appear_timeout = std::chrono::milliseconds(0);
+    options.restore_timeout = std::chrono::milliseconds(0);
+    options.retry_interval = std::chrono::milliseconds(1);
+    return options;
+}
+
+pipeduck::SinkInput playback_input(uint32_t index, uint32_t sink, const std::string& serial,
+                                   const std::string& app = "Discord") {
+    pipeduck::SinkInput input;
+    input.index = index;
+    input.sink = sink;
+    input.properties = {
+        {"application.name", app},
+        {"media.class", "Stream/Output/Audio"},
+        {"object.serial", serial},
+    };
+    return input;
 }
 
 void test_common() {
@@ -511,6 +749,239 @@ void test_routing_link_plan() {
     }
 }
 
+void test_routing_backend_startup() {
+    g_current_test = "routing-backend-startup";
+    const auto make_engine = [](const std::shared_ptr<FakeRoutingBackend>& backend) {
+        return pipeduck::RoutingEngine(std::nullopt, std::nullopt, backend);
+    };
+
+    {
+        // The second link fails once. The retry must not recreate the first one.
+        auto backend = std::make_shared<FakeRoutingBackend>();
+        backend->fail_create_input = backend->real_sink_name + ":playback_FR";
+        backend->fail_create_input_calls = 1;
+        auto options = fast_routing_options();
+        options.port_appear_timeout = std::chrono::milliseconds(500);
+        auto engine = make_engine(backend);
+        auto session = engine.start(options);
+        CHECK(backend->links.size() == 2);
+        CHECK(backend->create_link_calls == 3);
+        CHECK(backend->sink_destroyed == false);
+        CHECK(session.virtual_sink_name() == backend->virtual_sink_name);
+        const auto cleanup = session.stop();
+        CHECK(cleanup.complete);
+        CHECK(backend->sink_destroyed);
+        CHECK(backend->links.empty());
+    }
+    {
+        // A terminal link failure removes the partial link and destroys the sink.
+        auto backend = std::make_shared<FakeRoutingBackend>();
+        backend->fail_create_input = backend->real_sink_name + ":playback_FR";
+        backend->fail_create_input_calls = 100;
+        auto options = fast_routing_options();
+        auto engine = make_engine(backend);
+        bool threw = false;
+        try {
+            (void)engine.start(options);
+        } catch (const std::exception& error) {
+            threw = true;
+            const std::string message = error.what();
+            CHECK(message.find("could not route") != std::string::npos);
+            CHECK(message.find("real:playback_FR") != std::string::npos);
+        }
+        CHECK(threw);
+        CHECK(backend->create_link_calls == 2);
+        CHECK(backend->remove_link_calls >= 1);
+        CHECK(backend->links.empty());
+        CHECK(backend->sink_destroyed);
+    }
+    {
+        // Missing ports are reported clearly and still trigger sink cleanup.
+        auto backend = std::make_shared<FakeRoutingBackend>();
+        backend->output_ports.clear();
+        auto engine = make_engine(backend);
+        bool threw = false;
+        try {
+            (void)engine.start(fast_routing_options());
+        } catch (const std::exception& error) {
+            threw = true;
+            CHECK(std::string(error.what()).find("no monitor ports") != std::string::npos);
+        }
+        CHECK(threw);
+        CHECK(backend->create_link_calls == 0);
+        CHECK(backend->sink_destroyed);
+    }
+    {
+        // A virtual sink that never appears fails startup without leaking links.
+        auto backend = std::make_shared<FakeRoutingBackend>();
+        backend->sink_present = false;
+        auto engine = make_engine(backend);
+        CHECK_THROW(engine.start(fast_routing_options()));
+        CHECK(backend->wait_for_sink_calls == 1);
+        CHECK(backend->create_link_calls == 0);
+        CHECK(backend->links.empty());
+    }
+}
+
+void test_routing_backend_monitor_links() {
+    g_current_test = "routing-backend-monitor-links";
+    auto backend = std::make_shared<FakeRoutingBackend>();
+    pipeduck::RoutingEngine engine(std::nullopt, std::nullopt, backend);
+    auto session = engine.start(fast_routing_options());
+    CHECK(backend->links.size() == 2);
+
+    backend->links.pop_back();
+    CHECK(session.ensure_monitor_links());
+    CHECK(backend->links.size() == 2);
+    CHECK(backend->create_link_calls == 3);
+
+    backend->fail_list_links_calls = 1;
+    CHECK(!session.ensure_monitor_links());
+    CHECK(backend->links.size() == 2);
+
+    const auto cleanup = session.stop();
+    CHECK(cleanup.complete);
+}
+
+void test_routing_backend_restore_failure() {
+    g_current_test = "routing-backend-restore-failure";
+    auto backend = std::make_shared<FakeRoutingBackend>();
+    pipeduck::RoutingEngine engine(std::nullopt, std::nullopt, backend);
+    auto session = engine.start(fast_routing_options());
+
+    backend->inputs.push_back(playback_input(7, backend->real_sink_index, "42"));
+    CHECK(session.route_existing_outputs(std::nullopt) == 1);
+    CHECK(backend->inputs[0].sink == backend->virtual_sink_index);
+
+    backend->fail_move_to_index_calls = 100;
+    backend->fail_move_to_name_calls = 100;
+    const auto cleanup = session.stop();
+    CHECK(!cleanup.complete);
+    CHECK(cleanup.sink_left_alive);
+    CHECK(backend->sink_abandoned);
+    CHECK(!backend->sink_destroyed);
+    CHECK(cleanup.failed_inputs.size() == 1);
+    CHECK(cleanup.failed_inputs[0] == 7);
+    CHECK(backend->links.size() == 2);
+
+    const int moves = backend->move_calls;
+    const auto repeated = session.stop();
+    CHECK(repeated.complete == cleanup.complete);
+    CHECK(repeated.sink_left_alive == cleanup.sink_left_alive);
+    CHECK(backend->move_calls == moves);
+    CHECK(!backend->sink_destroyed);
+}
+
+void test_routing_backend_stream_changes() {
+    g_current_test = "routing-backend-stream-changes";
+    {
+        // A stream that disappears before teardown is not reported as a failure.
+        auto backend = std::make_shared<FakeRoutingBackend>();
+        pipeduck::RoutingEngine engine(std::nullopt, std::nullopt, backend);
+        auto session = engine.start(fast_routing_options());
+        backend->inputs.push_back(playback_input(7, backend->real_sink_index, "42"));
+        CHECK(session.route_existing_outputs(std::nullopt) == 1);
+        backend->inputs.clear();
+        const auto cleanup = session.stop();
+        CHECK(cleanup.complete);
+        CHECK(backend->move_calls == 1);
+        CHECK(backend->sink_destroyed);
+    }
+    {
+        // A reused sink-input index must not be moved during restore.
+        auto backend = std::make_shared<FakeRoutingBackend>();
+        pipeduck::RoutingEngine engine(std::nullopt, std::nullopt, backend);
+        auto session = engine.start(fast_routing_options());
+        backend->inputs.push_back(playback_input(7, backend->real_sink_index, "42"));
+        CHECK(session.route_existing_outputs(std::nullopt) == 1);
+        backend->inputs[0] =
+            playback_input(7, backend->real_sink_index, "99", "An unrelated application");
+        const auto cleanup = session.stop();
+        CHECK(cleanup.complete);
+        CHECK(backend->move_calls == 1);
+        CHECK(backend->sink_destroyed);
+    }
+}
+
+void test_routing_backend_sink_disappearance() {
+    g_current_test = "routing-backend-sink-disappearance";
+    auto backend = std::make_shared<FakeRoutingBackend>();
+    pipeduck::RoutingEngine engine(std::nullopt, std::nullopt, backend);
+    auto session = engine.start(fast_routing_options());
+
+    backend->fail_sink_inputs = true;
+    backend->sink_present = false;
+    const auto cleanup = session.stop();
+    CHECK(cleanup.complete);
+    CHECK(!cleanup.sink_left_alive);
+    CHECK(cleanup.detail.find("disappeared") != std::string::npos);
+    CHECK(!backend->sink_destroyed);
+    CHECK(!backend->sink_abandoned);
+}
+
+void test_routing_backend_factory() {
+    g_current_test = "routing-backend-factory";
+    auto backend = pipeduck::make_pulse_routing_backend();
+    CHECK(backend != nullptr);
+
+    // Exercise the production command adapter with a fake `pw-link` on PATH so
+    // the smoke test does not touch the real audio graph.
+    const auto bin_dir =
+        std::filesystem::temp_directory_path() /
+        ("pipeduck-routing-test-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(bin_dir);
+    const auto script = bin_dir / "pw-link";
+    {
+        std::ofstream out(script);
+        out << "#!/bin/sh\n"
+               "case \"$1\" in\n"
+               "  -o) echo 'pipeduck-1:monitor_FL'; echo 'pipeduck-1:monitor_FR' ;;\n"
+               "  -i) echo 'real:playback_FL'; echo 'real:playback_FR' ;;\n"
+               "  -l) echo 'pipeduck-1:monitor_FL'; echo '  |-> real:playback_FL' ;;\n"
+               "  -d) exit 0 ;;\n"
+               "  fail-output) echo 'simulated link failure' >&2; exit 1 ;;\n"
+               "  *) exit 0 ;;\n"
+               "esac\n";
+    }
+    std::filesystem::permissions(script, std::filesystem::perms::owner_read |
+                                             std::filesystem::perms::owner_write |
+                                             std::filesystem::perms::owner_exec);
+
+    const std::string original_path = std::getenv("PATH") != nullptr ? std::getenv("PATH") : "";
+    const auto restore = [&]() {
+        setenv("PATH", original_path.c_str(), 1);
+        std::error_code ignored;
+        std::filesystem::remove_all(bin_dir, ignored);
+    };
+
+    try {
+        setenv("PATH", bin_dir.c_str(), 1);
+        CHECK(backend->list_output_ports().find("monitor_FR") != std::string::npos);
+        CHECK(backend->list_input_ports().find("playback_FL") != std::string::npos);
+        CHECK(pipeduck::parse_link_list(backend->list_links()).size() == 1);
+        const pipeduck::PortLink link{"pipeduck-1:monitor_FL", "real:playback_FL"};
+        backend->create_link(link);
+        backend->remove_link(link);
+        bool failed = false;
+        try {
+            backend->create_link({"fail-output", "fail-input"});
+        } catch (const std::exception& error) {
+            failed = true;
+            const std::string message = error.what();
+            CHECK(message.find("could not link fail-output -> fail-input") != std::string::npos);
+            CHECK(message.find("simulated link failure") != std::string::npos);
+        }
+        CHECK(failed);
+    } catch (...) {
+        restore();
+        throw;
+    }
+    restore();
+    CHECK(std::getenv("PATH") != nullptr);
+    CHECK(std::string(std::getenv("PATH")) == original_path);
+}
+
 void test_routed_stream_identity() {
     g_current_test = "routed-stream-identity";
     const auto input = [](uint32_t index, uint32_t sink, const std::string& serial,
@@ -926,6 +1397,12 @@ int main() {
     test_routing_ports();
     test_routing_links();
     test_routing_link_plan();
+    test_routing_backend_startup();
+    test_routing_backend_monitor_links();
+    test_routing_backend_restore_failure();
+    test_routing_backend_stream_changes();
+    test_routing_backend_sink_disappearance();
+    test_routing_backend_factory();
     test_routed_stream_identity();
     test_routed_stream_reconcile();
     test_restore_routed_streams();
