@@ -22,6 +22,8 @@ std::string join(const std::vector<std::string>& values, const std::string& sepa
 struct CommandResult {
     int exit_code = -1;
     bool timed_out = false;
+    // Set when the command could not be run or its pipes could not be read.
+    std::string error;
     std::string out;
     std::string err;
 };

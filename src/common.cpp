@@ -171,24 +171,29 @@ CommandResult run_command(const std::string& program, const std::vector<std::str
 
     bool out_open = true;
     bool err_open = true;
+    bool terminated = false;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (out_open || err_open) {
         const auto now = std::chrono::steady_clock::now();
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-        if (remaining.count() <= 0) {
+        if (now >= deadline) {
             result.timed_out = true;
-            kill(-pid, SIGKILL);
-            kill(pid, SIGKILL);
+            terminated = true;
             break;
         }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
         pollfd fds[2] = {
             {out_pipe[0], static_cast<short>(out_open ? POLLIN : 0), 0},
             {err_pipe[0], static_cast<short>(err_open ? POLLIN : 0), 0},
         };
-        const int wait_ms = static_cast<int>(std::min<std::int64_t>(remaining.count(), 50));
-        const int polled = poll(fds, 2, wait_ms);
-        if (polled < 0 && errno != EINTR) {
+        const int wait_ms = static_cast<int>(std::max<std::int64_t>(remaining.count(), 1));
+        const int polled = poll(fds, 2, std::min(wait_ms, 50));
+        if (polled < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            result.error = "poll failed: " + std::string(std::strerror(errno));
+            terminated = true;
             break;
         }
         if (polled > 0) {
@@ -201,18 +206,80 @@ CommandResult run_command(const std::string& program, const std::vector<std::str
         }
     }
 
-    if (result.timed_out) {
-        // Give the process a moment to die, then drain what is left.
-        int status = 0;
-        waitpid(pid, &status, 0);
+    const auto kill_child = [&pid]() {
+        if (pid <= 0) {
+            return;
+        }
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+    };
+
+    // Pipes can close while the child is still running (for example, when it
+    // redirects its own output). Never wait unconditionally: keep polling
+    // waitpid() until the original deadline.
+    int status = 0;
+    bool reaped = false;
+    const auto reap_deadline =
+        terminated ? std::chrono::steady_clock::now() + std::chrono::seconds(2) : deadline;
+    for (;;) {
+        const pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) {
+            reaped = true;
+            break;
+        }
+        if (waited < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno != ECHILD) {
+                result.error = "waitpid failed: " + std::string(std::strerror(errno));
+            }
+            break;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= reap_deadline) {
+            if (!terminated) {
+                result.timed_out = true;
+                terminated = true;
+            }
+            break;
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(reap_deadline - now);
+        poll(nullptr, 0, static_cast<int>(std::min<std::int64_t>(remaining.count(), 20)));
+    }
+
+    if (terminated) {
+        kill_child();
+        // Reap the killed child, but do not block forever if it is stuck in an
+        // uninterruptible state. The timeout remains reported either way.
+        const auto final_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!reaped && std::chrono::steady_clock::now() < final_deadline) {
+            const pid_t waited = waitpid(pid, &status, WNOHANG);
+            if (waited == pid) {
+                reaped = true;
+                break;
+            }
+            if (waited < 0 && errno != EINTR) {
+                break;
+            }
+            poll(nullptr, 0, 10);
+        }
         append_available(out_pipe[0], result.out, out_open);
         append_available(err_pipe[0], result.err, err_open);
-        result.exit_code = 124;
-    } else {
-        int status = 0;
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        if (result.timed_out) {
+            result.exit_code = 124;
         }
-        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+    } else if (reaped) {
+        append_available(out_pipe[0], result.out, out_open);
+        append_available(err_pipe[0], result.err, err_open);
+        if (WIFEXITED(status)) {
+            result.exit_code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            result.exit_code = 128 + WTERMSIG(status);
+        } else {
+            result.error = "child did not exit normally";
+        }
     }
 
     close(out_pipe[0]);
@@ -223,13 +290,22 @@ CommandResult run_command(const std::string& program, const std::vector<std::str
 std::string run_command_checked(const std::string& program, const std::vector<std::string>& args,
                                 std::chrono::milliseconds timeout) {
     const CommandResult result = run_command(program, args, timeout);
+    if (!result.error.empty()) {
+        throw std::runtime_error(program + " failed: " + result.error);
+    }
     if (result.timed_out) {
-        throw std::runtime_error(program + " timed out");
+        std::string error = program + " timed out after " + std::to_string(timeout.count()) + " ms";
+        const std::string detail = trim(result.err);
+        if (!detail.empty()) {
+            error += ": " + detail;
+        }
+        throw std::runtime_error(error);
     }
     if (result.exit_code != 0) {
-        std::string error = trim(result.err);
-        if (error.empty()) {
-            error = "exit code " + std::to_string(result.exit_code);
+        std::string error = "exit code " + std::to_string(result.exit_code);
+        const std::string detail = trim(result.err);
+        if (!detail.empty()) {
+            error += ": " + detail;
         }
         throw std::runtime_error(program + " failed: " + error);
     }

@@ -1,5 +1,6 @@
 #include "pipeduck/cli.hpp"
 
+#include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -21,16 +22,20 @@ int parse_int_arg(const std::string& value, const std::string& option) {
 }
 
 double parse_double_arg(const std::string& value, const std::string& option) {
+    std::size_t consumed = 0;
+    double result = 0.0;
     try {
-        std::size_t consumed = 0;
-        const double result = std::stod(value, &consumed);
-        if (consumed != value.size()) {
-            throw std::invalid_argument("trailing characters");
-        }
-        return result;
+        result = std::stod(value, &consumed);
     } catch (const std::exception&) {
         throw std::runtime_error(option + " expects a number, got '" + value + "'");
     }
+    if (consumed != value.size()) {
+        throw std::runtime_error(option + " expects a number, got '" + value + "'");
+    }
+    if (!std::isfinite(result)) {
+        throw std::runtime_error(option + " expects a finite number, got '" + value + "'");
+    }
+    return result;
 }
 
 std::string need_value(int argc, char** argv, int& index, const std::string& option) {

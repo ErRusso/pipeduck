@@ -183,6 +183,12 @@ label = "USB Microphone"
 | `voice_source` | Optional voice-call stream to exclude from ducking. Routing follows the current default output. |
 | `mic_source` | Optional microphone. When unset, the default microphone is used. |
 
+Both thresholds use the same hysteresis: speech must exceed roughly twice the configured RMS value
+to start ducking and stay above 0.75x of it to remain active. The tuners label these values as
+`start` and the base threshold; a microphone therefore starts a little later than the call stream
+at the same sensitivity. Non-finite values such as `nan` or `inf` are rejected instead of being
+silently clamped.
+
 The configuration schema is compatible with pw-duck's `config.toml`; missing new keys receive the
 defaults above.
 
@@ -214,8 +220,22 @@ immediately cancels the upward ramp and fades back down from the current volume.
 
 On shutdown, streams are moved back to their original sinks, monitor links are removed and the
 virtual sink is destroyed. PipeDuck does not restore the default sink, because the user may have
-switched outputs while ducking was active. If a stream cannot be moved away safely, the virtual sink
-is deliberately left alive so that active application audio is not terminated.
+switched outputs while ducking was active. Each routed stream is remembered by its `object.serial`
+(PipeWire), `node.name` or application label, so a reused sink-input index is never mistaken for
+the original stream.
+
+If a stream cannot be moved away safely, the virtual sink is deliberately left alive so that active
+application audio is not terminated. Cleanup then reports the failed and skipped stream indices:
+`route-once` exits nonzero instead of printing `Restored.`, and the tray switches to
+`NeedsAttention` instead of `Off`. The abandoned sink belongs to the running PipeDuck process; when
+that process exits, PipeWire removes the node and normally moves any remaining streams to the
+current default output.
+
+While ducking is active, PipeDuck also verifies that the virtual sink, the real sink and the monitor
+links still exist. If the graph changed (for example because WirePlumber restarted), the session is
+rebuilt against the current default output with bounded backoff instead of silently reporting
+`Ducked`. Volume updates never spawn `pactl` from the 25 ms control tick; if the libpulse backend is
+lost, the tray reports a degraded state and the last rejected volume is retried when it returns.
 
 ## Tuning
 
@@ -270,11 +290,64 @@ it in the tray tooltip.
 
 - Check `release_fade_ms`; `0` means instant, larger values mean a longer ramp.
 - Run `pipeduck status` and inspect whether "Voice inactive" appears in the tray.
-- If a stream stayed on a leftover `pipeduck-*` sink after an abnormal exit, move it back with:
-  ```bash
-  pactl list sink-inputs short
-  pactl move-sink-input <index> <your-sink>
-  ```
+- If the tray reports `Degraded`, the libpulse volume backend is unavailable. Volume updates resume
+  automatically when it returns; restarting the tray is a safe fallback if it does not.
+
+### Configuration is rejected or ignored
+
+PipeDuck refuses non-finite numbers (`nan`, `inf`, `-inf`) and malformed values instead of silently
+accepting them. A bad edit is ignored while the tray is running, and the last valid settings stay
+active. Validate the file without changing the graph:
+
+```bash
+pipeduck status
+pipeduck init-config     # only creates the file when it is absent
+pipeduck config-path
+```
+
+The error names the offending key. Restore a finite threshold such as `0.01` and save the file
+again; the running tray reloads it within a few hundred milliseconds.
+
+### A stream stayed on the virtual sink
+
+If cleanup could not move every stream back, PipeDuck intentionally leaves the `pipeduck-*` sink
+alive. This is safer than destroying the sink and terminating application audio. `route-once` exits
+with status 1, and the tray shows `NeedsAttention` instead of `Off`; the message lists the stream
+indices that could not be restored. Do not delete the sink while audio is playing. Move the stream
+manually, then restart PipeDuck:
+
+```bash
+pactl list sink-inputs short
+pactl move-sink-input <index> <your-sink>
+```
+
+The abandoned sink exists only for the lifetime of the PipeDuck process. After the process exits,
+PipeWire removes it and normally moves any remaining streams to the current default output. This is
+also why a crash or `SIGKILL` can leave a sink visible until the process is gone; use
+`pactl list sinks short | grep pipeduck` to check.
+
+### PipeWire or PulseAudio became unavailable
+
+If WirePlumber or PipeWire restarts, the tray may briefly show `Recovering` and then resume with
+`Ready`. PipeDuck re-creates the virtual sink, monitor links and routed streams against the current
+default output. If recovery keeps failing, check the backend before restarting the app:
+
+```bash
+pactl info
+pipewire --version
+pw-link -l | head
+systemctl --user status pipewire wireplumber
+```
+
+A missing `pactl` or `pw-link` is reported as a routing failure. Install the matching PipeWire
+utilities; PipeDuck does not bundle them. The optional `PIPEDUCK_ICON_THEME_PATH` variable only
+affects icon lookup, not the audio graph.
+
+### Running routing tests without touching the desktop
+
+The unit suite needs no audio server. For routing changes, use a temporary config directory and a
+dedicated null sink as described in [CONTRIBUTING.md](CONTRIBUTING.md). Never point a diagnostic
+`route` command at your real output while other audio is playing.
 
 ## Development
 
@@ -297,9 +370,11 @@ python3 -m pip install pillow
 scripts/generate-icons.py
 ```
 
-The unit tests cover TOML parsing, identity matching, VAD hysteresis, port pairing, Pulse JSON
-parsing and the volume-ramp curve. An optional integration test against a live local PipeWire
-session is described in [CONTRIBUTING.md](CONTRIBUTING.md).
+The unit tests cover TOML parsing and validation, identity matching, VAD hysteresis, port pairing,
+link-list reconciliation, routed-stream identity/pruning/restoration, cleanup diagnostics, Pulse
+JSON parsing, tray state transitions and the volume-ramp curve. The tray integration test runs on a
+private session bus. A safe recipe for routing tests against an isolated local PipeWire session is
+described in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Differences from pw-duck
 

@@ -1,12 +1,19 @@
 #include "pipeduck/config.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace pipeduck {
 namespace {
@@ -87,16 +94,25 @@ int parse_int(const std::string& value, int line_number) {
 }
 
 double parse_double(const std::string& value, int line_number) {
+    std::size_t consumed = 0;
+    double result = 0.0;
     try {
-        std::size_t consumed = 0;
-        const double result = std::stod(value, &consumed);
-        if (consumed != value.size()) {
-            throw std::invalid_argument("trailing characters");
-        }
-        return result;
+        result = std::stod(value, &consumed);
     } catch (const std::exception&) {
         throw std::runtime_error("line " + std::to_string(line_number) + ": expected a number");
     }
+    if (consumed != value.size()) {
+        throw std::runtime_error("line " + std::to_string(line_number) + ": expected a number");
+    }
+    if (!std::isfinite(result)) {
+        throw std::runtime_error("line " + std::to_string(line_number) +
+                                 ": expected a finite number");
+    }
+    return result;
+}
+
+double finite_or(double value, double fallback) {
+    return std::isfinite(value) ? value : fallback;
 }
 
 std::string quote(const std::string& value) {
@@ -185,9 +201,15 @@ Config Config::defaults() {
 Config Config::normalized() const {
     Config result = *this;
     result.duck_percent = std::clamp(result.duck_percent, 0, 100);
-    result.vad_threshold = std::clamp(result.vad_threshold, 0.0025, 0.2);
+    result.vad_threshold = std::clamp(finite_or(result.vad_threshold, 0.01), 0.0025, 0.2);
     if (result.mic_vad_threshold.has_value()) {
-        result.mic_vad_threshold = std::clamp(*result.mic_vad_threshold, 0.0025, 0.2);
+        if (!std::isfinite(*result.mic_vad_threshold)) {
+            // An invalid optional value falls back to vad_threshold, matching
+            // the "unset" behavior used by older configurations.
+            result.mic_vad_threshold.reset();
+        } else {
+            result.mic_vad_threshold = std::clamp(*result.mic_vad_threshold, 0.0025, 0.2);
+        }
     }
     result.hold_ms = std::clamp(result.hold_ms, 0, 4000);
     result.attack_fade_ms = std::clamp(result.attack_fade_ms, 0, 2000);
@@ -224,23 +246,60 @@ void Config::save() const {
     const auto path = config_path();
     std::filesystem::create_directories(path.parent_path());
     const std::string text = serialize(normalized());
-    const auto temporary = path.string() + ".tmp";
-    {
-        std::ofstream output(temporary, std::ios::trunc);
-        if (!output) {
-            throw std::runtime_error("failed to write " + temporary);
-        }
-        output << text;
-        output.flush();
-        if (!output) {
-            throw std::runtime_error("failed to write " + temporary);
-        }
+
+    // A unique temporary file in the destination directory avoids two tuners
+    // writing the same sidecar file. All writers use the same atomic replace,
+    // so concurrent saves are last-writer-wins but never expose a partial file.
+    std::string template_path = path.string() + ".tmp.XXXXXX";
+    std::vector<char> template_buffer(template_path.begin(), template_path.end());
+    template_buffer.push_back('\0');
+    const int fd = mkstemp(template_buffer.data());
+    if (fd < 0) {
+        throw std::runtime_error("failed to create temporary config file for " + path.string() +
+                                 ": " + std::strerror(errno));
     }
-    std::error_code error;
-    std::filesystem::rename(temporary, path, error);
-    if (error) {
-        std::filesystem::remove(path, error);
-        std::filesystem::rename(temporary, path);
+    const std::string temporary(template_buffer.data());
+
+    std::string write_error;
+    std::size_t written = 0;
+    while (written < text.size()) {
+        const ssize_t count = write(fd, text.data() + written, text.size() - written);
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            write_error = std::strerror(errno);
+            break;
+        }
+        written += static_cast<std::size_t>(count);
+    }
+    if (write_error.empty() && fsync(fd) != 0) {
+        write_error = std::strerror(errno);
+    }
+    if (close(fd) != 0 && write_error.empty()) {
+        write_error = std::strerror(errno);
+    }
+    if (!write_error.empty()) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw std::runtime_error("failed to write " + temporary + ": " + write_error);
+    }
+
+    if (::rename(temporary.c_str(), path.c_str()) != 0) {
+        const std::string error = std::strerror(errno);
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        // Never unlink the existing configuration as a fallback: preserving the
+        // last known-good file is more important than completing this write.
+        throw std::runtime_error("failed to replace " + path.string() + ": " + error);
+    }
+
+    // Best-effort directory sync so the rename survives a crash on filesystems
+    // that require it. Failure here does not invalidate the new file.
+    const int directory = open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory >= 0) {
+        fsync(directory);
+        close(directory);
     }
 }
 

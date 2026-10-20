@@ -3,9 +3,13 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "pipeduck/config.hpp"
+#include "pipeduck/pipewire.hpp"
+#include "pipeduck/pulse.hpp"
 
 namespace pipeduck {
 
@@ -34,11 +38,33 @@ private:
     DuckingSettings settings_;
 };
 
+struct CallTarget {
+    CaptureTarget capture;
+    std::string label;
+};
+
+// Finds the configured call stream and builds a diagnostic label for it. This
+// overload is separate from PulseCtl so the matching/label logic can be tested
+// without a live audio server.
+std::optional<CallTarget> find_call_target(const std::vector<SinkInput>& inputs,
+                                           const ConfiguredSource& source);
+
 enum class DuckingEventType {
     WaitingForSource,
     Started,
     VoiceActive,
     VoiceInactive,
+    // A route session could not be created. The worker will retry with backoff.
+    RoutingFailed,
+    // An established session noticed that its graph disappeared and is about to
+    // rebuild it.
+    Recovering,
+    // The session is still running but part of its functionality is unavailable
+    // (for example, monitor volume updates keep failing).
+    Degraded,
+    // Cleanup could not restore every routed stream. The virtual sink is left
+    // alive and the caller must not report a clean stop.
+    RestoreFailed,
     Message,
 };
 

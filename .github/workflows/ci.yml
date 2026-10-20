@@ -44,6 +44,84 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  sanitizers:
+    name: Sanitizers (${{ matrix.sanitizer }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: address-undefined
+            build_dir: build-asan
+            cxx_flags: -fsanitize=address,undefined -fno-omit-frame-pointer -g
+            test_regex: ^pipeduck_tests$
+          - sanitizer: thread
+            build_dir: build-tsan
+            cxx_flags: -fsanitize=thread -fno-omit-frame-pointer -g
+            test_regex: ^pipeduck_tests$
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake pkg-config libpipewire-0.3-dev libpulse-dev libjson-c-dev \
+            libglib2.0-dev libncurses-dev
+
+      - name: Configure
+        run: >
+          cmake -S . -B "${{ matrix.build_dir }}"
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DPIPEDUCK_GUI=OFF
+          -DPIPEDUCK_BUILD_TESTS=ON
+          -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}"
+
+      - name: Build
+        run: cmake --build "${{ matrix.build_dir }}" --parallel
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: >
+          ctest --test-dir "${{ matrix.build_dir }}" --output-on-failure
+          -R "${{ matrix.test_regex }}"
+
+  install:
+    name: Install smoke (GUI ${{ matrix.gui }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        gui: [ON, OFF]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake pkg-config libpipewire-0.3-dev libpulse-dev libjson-c-dev \
+            libglib2.0-dev libgtk-4-dev libncurses-dev
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-install
+          -DCMAKE_BUILD_TYPE=Release
+          -DPIPEDUCK_GUI=${{ matrix.gui }}
+          -DPIPEDUCK_BUILD_TESTS=OFF
+          -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/prefix-${{ matrix.gui }}"
+
+      - name: Build and install
+        run: |
+          cmake --build build-install --parallel
+          cmake --install build-install
+
+      - name: Check installed layout
+        run: tests/install_smoke.sh "$RUNNER_TEMP/prefix-${{ matrix.gui }}"
+
   format:
     name: Formatting
     runs-on: ubuntu-24.04

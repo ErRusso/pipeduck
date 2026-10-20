@@ -120,19 +120,25 @@ bool VolumeController::native() const {
     return impl_ != nullptr && impl_->available();
 }
 
-void VolumeController::set_percent(const std::string& source_name, double percent) {
+bool VolumeController::set_percent(const std::string& source_name, double percent,
+                                   bool allow_subprocess_fallback) {
     if (source_name.empty()) {
-        return;
+        return false;
     }
     if (impl_ != nullptr && impl_->set_native(source_name, percent)) {
-        return;
+        return true;
+    }
+    if (!allow_subprocess_fallback) {
+        return false;
     }
     try {
         const double clamped = std::clamp(percent, 0.0, 150.0);
         const int raw = static_cast<int>(std::lround(clamped / 100.0 * 65536.0));
         run_status_checked("pactl", {"set-source-volume", source_name, std::to_string(raw)});
+        return true;
     } catch (const std::exception& error) {
         std::cerr << "pipeduck: could not set monitor volume: " << error.what() << "\n";
+        return false;
     }
 }
 

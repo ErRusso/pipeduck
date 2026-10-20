@@ -226,7 +226,15 @@ int run_route(const pipeduck::CliOptions& cli, bool once) {
     if (once) {
         pipeduck::RoutingEngine engine(config.voice_source, config.mic_source);
         auto session = engine.start();
-        session.set_percent(settings.duck_percent);
+        if (!session.set_percent(settings.duck_percent, true)) {
+            std::cerr << "pipeduck: could not set the monitor volume to " << settings.duck_percent
+                      << "%\n";
+            const auto cleanup = session.stop();
+            if (!cleanup.complete) {
+                std::cerr << "pipeduck: " << pipeduck::describe_cleanup(cleanup) << "\n";
+            }
+            return 1;
+        }
         std::cout << "Routing active through " << session.virtual_sink_name() << " at "
                   << settings.duck_percent << "% for " << cli.seconds << " seconds.\n";
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(cli.seconds);
@@ -235,7 +243,11 @@ int run_route(const pipeduck::CliOptions& cli, bool once) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         session.set_neutral();
-        session.stop();
+        const auto cleanup = session.stop();
+        if (!cleanup.complete) {
+            std::cerr << "pipeduck: " << pipeduck::describe_cleanup(cleanup) << "\n";
+            return 1;
+        }
         std::cout << "Restored.\n";
         return 0;
     }
@@ -243,31 +255,51 @@ int run_route(const pipeduck::CliOptions& cli, bool once) {
     install_signal_handlers();
     pipeduck::SettingsStore store(settings);
     std::cout << "Ducking is active. Press Ctrl+C to stop.\n";
-    pipeduck::run_until_stopped(g_stop, store, false, [](const pipeduck::DuckingEvent& event) {
-        switch (event.type) {
-        case pipeduck::DuckingEventType::WaitingForSource:
-            std::cout << (event.message.empty() ? "Waiting for a voice source..." : event.message)
-                      << std::endl;
-            break;
-        case pipeduck::DuckingEventType::Started:
-            std::cout << "Routing active. Source=" << event.label
-                      << " threshold=" << pipeduck::format_double(event.threshold, 4)
-                      << " start=" << pipeduck::format_double(event.start_threshold, 4)
-                      << " hold=" << event.hold_ms << "ms" << std::endl;
-            break;
-        case pipeduck::DuckingEventType::VoiceActive:
-            std::cout << "VOICE ACTIVE level=" << pipeduck::format_double(event.level, 4)
-                      << " -> ducking " << event.duck_percent << "%" << std::endl;
-            break;
-        case pipeduck::DuckingEventType::VoiceInactive:
-            std::cout << "VOICE INACTIVE level=" << pipeduck::format_double(event.level, 4)
-                      << " -> smooth return" << std::endl;
-            break;
-        case pipeduck::DuckingEventType::Message:
-            std::cout << event.message << std::endl;
-            break;
-        }
-    });
+    bool restore_failed = false;
+    pipeduck::run_until_stopped(
+        g_stop, store, false, [&restore_failed](const pipeduck::DuckingEvent& event) {
+            switch (event.type) {
+            case pipeduck::DuckingEventType::WaitingForSource:
+                std::cout << (event.message.empty() ? "Waiting for a voice source..."
+                                                    : event.message)
+                          << std::endl;
+                break;
+            case pipeduck::DuckingEventType::Started:
+                std::cout << "Routing active. Source=" << event.label
+                          << " threshold=" << pipeduck::format_double(event.threshold, 4)
+                          << " start=" << pipeduck::format_double(event.start_threshold, 4)
+                          << " hold=" << event.hold_ms << "ms" << std::endl;
+                break;
+            case pipeduck::DuckingEventType::VoiceActive:
+                std::cout << "VOICE ACTIVE level=" << pipeduck::format_double(event.level, 4)
+                          << " -> ducking " << event.duck_percent << "%" << std::endl;
+                break;
+            case pipeduck::DuckingEventType::VoiceInactive:
+                std::cout << "VOICE INACTIVE level=" << pipeduck::format_double(event.level, 4)
+                          << " -> smooth return" << std::endl;
+                break;
+            case pipeduck::DuckingEventType::RoutingFailed:
+                std::cerr << "Routing failed: " << event.message << "; retrying" << std::endl;
+                break;
+            case pipeduck::DuckingEventType::Recovering:
+                std::cout << event.message << std::endl;
+                break;
+            case pipeduck::DuckingEventType::Degraded:
+                std::cerr << "Degraded: " << event.message << std::endl;
+                break;
+            case pipeduck::DuckingEventType::RestoreFailed:
+                restore_failed = true;
+                std::cerr << "Restore incomplete: " << event.message << std::endl;
+                break;
+            case pipeduck::DuckingEventType::Message:
+                std::cout << event.message << std::endl;
+                break;
+            }
+        });
+    if (restore_failed) {
+        std::cerr << "Stopped with streams left on the virtual sink.\n";
+        return 1;
+    }
     std::cout << "Stopped and restored.\n";
     return 0;
 }

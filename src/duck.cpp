@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -22,31 +23,21 @@ constexpr auto kTickInterval = std::chrono::milliseconds(25);
 constexpr auto kSourceCheckInterval = std::chrono::milliseconds(500);
 constexpr auto kRouteRefreshInterval = std::chrono::milliseconds(500);
 constexpr auto kSinkCheckInterval = std::chrono::milliseconds(500);
+constexpr auto kLinkCheckInterval = std::chrono::milliseconds(2000);
 constexpr auto kConfigReloadInterval = std::chrono::milliseconds(250);
 constexpr auto kVadAttack = std::chrono::milliseconds(40);
+constexpr auto kInitialRoutingBackoff = std::chrono::milliseconds(500);
+constexpr auto kMaxRoutingBackoff = std::chrono::milliseconds(4000);
 
-struct CallTarget {
-    CaptureTarget capture;
-    std::string label;
-};
+void interruptible_sleep(const std::atomic<bool>& stop, std::chrono::milliseconds duration) {
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    while (!stop.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
 
 std::optional<CallTarget> find_call_target(const PulseCtl& pulse, const ConfiguredSource& source) {
-    for (const auto& input : pulse.sink_inputs()) {
-        if (!input.identity().matches_configured_source(source)) {
-            continue;
-        }
-        const AudioIdentity identity = input.identity();
-        CaptureTarget target;
-        target.label = "#" + std::to_string(input.index) + " " + source_label(identity);
-        target.node_name = identity.node_name;
-        const auto serial = input.properties.find("object.serial");
-        if (serial != input.properties.end() && !serial->second.empty()) {
-            target.object_serial = serial->second;
-        }
-        target.sink_monitor = true;
-        return CallTarget{std::move(target), target.label};
-    }
-    return std::nullopt;
+    return find_call_target(pulse.sink_inputs(), source);
 }
 
 std::optional<CaptureTarget> find_mic_target(const Config& config) {
@@ -125,11 +116,39 @@ enum class SessionEnd { StopRequested, SourceChanged, SinkChanged, RoutingFailed
 
 } // namespace
 
+std::optional<CallTarget> find_call_target(const std::vector<SinkInput>& inputs,
+                                           const ConfiguredSource& source) {
+    for (const auto& input : inputs) {
+        if (!input.identity().matches_configured_source(source)) {
+            continue;
+        }
+        const AudioIdentity identity = input.identity();
+        const std::string label = "#" + std::to_string(input.index) + " " + source_label(identity);
+        CaptureTarget target;
+        target.label = label;
+        target.node_name = identity.node_name;
+        const auto serial = input.properties.find("object.serial");
+        if (serial != input.properties.end() && !serial->second.empty()) {
+            target.object_serial = serial->second;
+        }
+        target.sink_monitor = true;
+        CallTarget result;
+        result.capture = std::move(target);
+        result.label = label;
+        return result;
+    }
+    return std::nullopt;
+}
+
 DuckingSettings DuckingSettings::normalized() const {
     DuckingSettings result = *this;
     result.duck_percent = std::clamp(result.duck_percent, 0, 100);
-    result.vad_threshold = std::clamp(result.vad_threshold, 0.0025, 0.2);
-    result.mic_vad_threshold = std::clamp(result.mic_vad_threshold, 0.0025, 0.2);
+    const double vad_fallback = DuckingSettings{}.vad_threshold;
+    result.vad_threshold = std::clamp(
+        std::isfinite(result.vad_threshold) ? result.vad_threshold : vad_fallback, 0.0025, 0.2);
+    result.mic_vad_threshold = std::clamp(
+        std::isfinite(result.mic_vad_threshold) ? result.mic_vad_threshold : vad_fallback, 0.0025,
+        0.2);
     result.hold_ms = std::clamp(result.hold_ms, 0, 4000);
     result.attack_fade_ms = std::clamp(result.attack_fade_ms, 0, 2000);
     result.release_fade_ms = std::clamp(result.release_fade_ms, 0, 3000);
@@ -192,6 +211,7 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
         }
     };
 
+    auto routing_backoff = kInitialRoutingBackoff;
     while (!stop.load()) {
         if (reload_config) {
             try {
@@ -285,12 +305,14 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
         try {
             RoutingEngine engine(exclusion, config.mic_source);
             session.emplace(engine.start());
+            routing_backoff = kInitialRoutingBackoff;
         } catch (const std::exception& error) {
             DuckingEvent event;
-            event.type = DuckingEventType::Message;
-            event.message = std::string("Routing failed: ") + error.what();
+            event.type = DuckingEventType::RoutingFailed;
+            event.message = error.what();
             on_event(event);
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            interruptible_sleep(stop, routing_backoff);
+            routing_backoff = std::min(routing_backoff * 2, kMaxRoutingBackoff);
             continue;
         }
 
@@ -309,7 +331,14 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
             event.message = std::string("Voice capture failed: ") + error.what();
             on_event(event);
             session->set_neutral();
-            session->stop();
+            const RouteCleanupResult cleanup = session->stop();
+            if (!cleanup.complete) {
+                DuckingEvent failed;
+                failed.type = DuckingEventType::RestoreFailed;
+                failed.message = describe_cleanup(cleanup);
+                on_event(failed);
+                return;
+            }
             std::this_thread::sleep_for(kWaitingPoll);
             continue;
         }
@@ -332,12 +361,26 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
         uint64_t last_call_frames = 0;
         uint64_t last_mic_frames = 0;
         bool ducked = false;
+        bool volume_degraded = false;
+        bool route_refresh_failed = false;
         std::optional<int> applied_duck_percent;
         auto next_source_check = std::chrono::steady_clock::now();
         auto next_route_refresh = std::chrono::steady_clock::now();
         auto next_sink_check = std::chrono::steady_clock::now();
+        auto next_link_check = std::chrono::steady_clock::now();
         auto next_config_reload = std::chrono::steady_clock::now();
         SessionEnd end = SessionEnd::StopRequested;
+
+        const auto report_degraded = [&](bool& flag, const std::string& message) {
+            if (flag) {
+                return;
+            }
+            flag = true;
+            DuckingEvent event;
+            event.type = DuckingEventType::Degraded;
+            event.message = message;
+            on_event(event);
+        };
 
         while (!stop.load()) {
             const auto now = std::chrono::steady_clock::now();
@@ -382,22 +425,44 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
             if (now >= next_route_refresh) {
                 try {
                     session->route_existing_outputs(exclusion);
-                } catch (const std::exception&) {
+                    route_refresh_failed = false;
+                } catch (const std::exception& error) {
+                    report_degraded(route_refresh_failed,
+                                    std::string("Could not refresh routed streams: ") +
+                                        error.what());
                 }
                 next_route_refresh = now + kRouteRefreshInterval;
             }
 
             if (now >= next_sink_check) {
                 try {
-                    const std::string default_sink = PulseCtl{}.default_sink_name();
+                    const PulseCtl pulse;
+                    const std::string default_sink = pulse.default_sink_name();
                     if (!default_sink.empty() && default_sink != session->real_sink_name() &&
                         default_sink != session->virtual_sink_name()) {
                         end = SessionEnd::SinkChanged;
                         break;
                     }
+                    if (!pulse.sink_by_name(session->real_sink_name()).has_value() ||
+                        !pulse.sink_by_name(session->virtual_sink_name()).has_value()) {
+                        end = SessionEnd::RoutingFailed;
+                        break;
+                    }
                 } catch (const std::exception&) {
+                    // The audio backend disappeared; rebuild against whatever
+                    // default sink is available when it returns.
+                    end = SessionEnd::RoutingFailed;
+                    break;
                 }
                 next_sink_check = now + kSinkCheckInterval;
+            }
+
+            if (now >= next_link_check) {
+                if (!session->ensure_monitor_links()) {
+                    end = SessionEnd::RoutingFailed;
+                    break;
+                }
+                next_link_check = now + kLinkCheckInterval;
             }
 
             const DuckingSettings active_settings = settings.get();
@@ -426,11 +491,16 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
             }
 
             if (voice_active != ducked) {
+                const bool started =
+                    voice_active ? session->start_ramp(active_settings.duck_percent,
+                                                       active_settings.attack_fade_ms)
+                                 : session->start_ramp(100.0, active_settings.release_fade_ms);
+                if (!started) {
+                    report_degraded(volume_degraded,
+                                    "Monitor volume updates are failing; audio may not be "
+                                    "attenuated");
+                }
                 if (voice_active) {
-                    // Cancel any release fade in progress and fade down from the
-                    // volume we are at right now, not from 100%.
-                    session->start_ramp(active_settings.duck_percent,
-                                        active_settings.attack_fade_ms);
                     applied_duck_percent = active_settings.duck_percent;
                     DuckingEvent event;
                     event.type = DuckingEventType::VoiceActive;
@@ -438,7 +508,6 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
                     event.duck_percent = active_settings.duck_percent;
                     on_event(event);
                 } else {
-                    session->start_ramp(100.0, active_settings.release_fade_ms);
                     applied_duck_percent.reset();
                     DuckingEvent event;
                     event.type = DuckingEventType::VoiceInactive;
@@ -447,7 +516,12 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
                 }
                 ducked = voice_active;
             } else if (ducked && applied_duck_percent != active_settings.duck_percent) {
-                session->start_ramp(active_settings.duck_percent, active_settings.attack_fade_ms);
+                if (!session->start_ramp(active_settings.duck_percent,
+                                         active_settings.attack_fade_ms)) {
+                    report_degraded(volume_degraded,
+                                    "Monitor volume updates are failing; audio may not be "
+                                    "attenuated");
+                }
                 applied_duck_percent = active_settings.duck_percent;
                 DuckingEvent event;
                 event.type = DuckingEventType::VoiceActive;
@@ -457,8 +531,12 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
             }
 
             // Drive the fade from the control tick instead of sleeping inside
-            // it. This keeps VAD sampling alive during attack and release.
-            session->tick_ramp();
+            // it. This keeps VAD sampling alive during attack and release. The
+            // tick never spawns a subprocess.
+            if (!session->tick_ramp()) {
+                report_degraded(volume_degraded,
+                                "Monitor volume updates are failing; audio may not be attenuated");
+            }
 
             std::this_thread::sleep_for(kTickInterval);
         }
@@ -476,10 +554,29 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
             session->ramp_to(100.0, fade, nullptr);
         }
         session->set_neutral();
-        session->stop();
+        const RouteCleanupResult cleanup = session->stop();
+        if (!cleanup.complete) {
+            DuckingEvent event;
+            event.type = DuckingEventType::RestoreFailed;
+            event.message = describe_cleanup(cleanup);
+            on_event(event);
+            // Do not start another session while streams may still be attached
+            // to the abandoned sink. The caller must surface this failure.
+            return;
+        }
 
         if (stop.load() || end == SessionEnd::StopRequested) {
             break;
+        }
+
+        if (end == SessionEnd::RoutingFailed || end == SessionEnd::SinkChanged) {
+            DuckingEvent event;
+            event.type = DuckingEventType::Recovering;
+            event.message = end == SessionEnd::SinkChanged
+                                ? "Default output changed; rebuilding the route"
+                                : "Audio graph changed; rebuilding the route";
+            on_event(event);
+            interruptible_sleep(stop, std::chrono::milliseconds(100));
         }
     }
 }

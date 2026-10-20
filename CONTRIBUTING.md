@@ -74,14 +74,53 @@ dbus-run-session -- build/pipeduck_tray_tests build/pipeduck
 ctest --test-dir build --output-on-failure
 ```
 
-To test against a live PipeWire session safely, create an isolated null sink instead of using your
-real output:
+To test against a live PipeWire session safely, use a temporary prefix, config directory and a
+separate null sink. The recipe below never touches your real output or saved configuration:
 
 ```bash
-pactl load-module module-null-sink sink_name=pipeduck-itest \
-  sink_properties=device.description=pipeduck-itest
-# play a test tone into it and use a temporary XDG_CONFIG_HOME:
-XDG_CONFIG_HOME=/tmp/pipeduck-test build/pipeduck sources
+export PIPEDUCK_TEST_ROOT=$(mktemp -d)
+mkdir -p "$PIPEDUCK_TEST_ROOT/config"
+null_module=$(pactl load-module module-null-sink sink_name=pipeduck-itest \
+  sink_properties=device.description=pipeduck-itest)
+
+# Make the test sink the default only for this shell.
+pactl set-default-sink pipeduck-itest
+
+# Generate a quiet test tone into the test sink for a few seconds.
+# ffmpeg is only needed for this diagnostic; it is not a PipeDuck dependency.
+ffmpeg -f lavfi -i sine=frequency=440:duration=5 -f pulse default pipeduck-itest-tone &
+
+XDG_CONFIG_HOME="$PIPEDUCK_TEST_ROOT/config" \
+  build/pipeduck init-config
+XDG_CONFIG_HOME="$PIPEDUCK_TEST_ROOT/config" \
+  build/pipeduck sources
+XDG_CONFIG_HOME="$PIPEDUCK_TEST_ROOT/config" \
+  build/pipeduck route-once --seconds 3 --yes-really-route
+
+# Clean up.
+pactl unload-module "$null_module"
+rm -rf "$PIPEDUCK_TEST_ROOT"
+```
+
+Run the install smoke test after changing CMake install rules:
+
+```bash
+prefix=$(mktemp -d)
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX="$prefix"
+cmake --build build -j"$(nproc)"
+cmake --install build
+tests/install_smoke.sh "$prefix"
+rm -rf "$prefix"
+```
+
+For deterministic sanitizer runs, use separate build directories:
+
+```bash
+cmake -S . -B build-asan -DPIPEDUCK_GUI=OFF \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+cmake --build build-asan -j"$(nproc)"
+ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+  ctest --test-dir build-asan --output-on-failure -R '^pipeduck_tests$'
 ```
 
 Test the following before a routing change:
@@ -99,8 +138,33 @@ Test the following before a routing change:
 
 - Keep changes focused and explain the user-visible effect.
 - Update README/config documentation when adding options.
-- Make sure the CI build (GCC and Clang), tests and formatting pass.
+- Make sure the CI build (GCC and Clang), sanitizer jobs, install smoke tests, tests and formatting
+  pass.
 - Commits should have clear messages. Squashing is fine.
+
+## Release checklist
+
+Version numbers live in three places:
+
+- `project(... VERSION ...)` in `CMakeLists.txt`;
+- the version and date in the `.TH` line of `docs/pipeduck.1`;
+- the newest entry in `CHANGELOG.md`.
+
+To publish a release:
+
+1. Bump all three versions in one commit and confirm the changelog describes user-visible changes.
+2. Run the local checks: GCC/Clang builds with GUI ON and OFF, `ctest`, the install smoke test and
+   at least the ASan+UBSan unit run.
+3. Create an annotated tag: `git tag -a vX.Y.Z -m "PipeDuck X.Y.Z"`.
+4. Push the commit and tag: `git push origin main --follow-tags` (or push the tag explicitly).
+5. The `Release` workflow checks out the tag, builds/tests both GUI configurations, runs the install
+   smoke test, creates `pipeduck-X.Y.Z.tar.gz` plus a SHA-256 sidecar, and only then publishes the
+   GitHub release.
+6. Verify that the release contains the archive and checksum and that `sha256sum -c` passes after
+   downloading it.
+
+Distribution-specific packages are optional follow-up work; the release publishes source artifacts
+only.
 
 ## License
 
