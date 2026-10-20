@@ -38,6 +38,16 @@ std::vector<PortLink> parse_link_list(const std::string& listing);
 std::vector<PortLink> missing_links(const std::vector<PortLink>& desired,
                                     const std::vector<PortLink>& existing);
 
+struct LinkPlan {
+    std::vector<PortLink> create;
+    std::vector<PortLink> remove;
+};
+
+// Reconcile the links a session owns with the links the server reports. Links
+// that this session created but no longer desires are marked for removal.
+LinkPlan plan_link_changes(const std::vector<PortLink>& desired, const std::vector<PortLink>& owned,
+                           const std::vector<PortLink>& existing);
+
 // A stream moved to the virtual sink, with enough identity to avoid restoring a
 // different stream if the server reuses its sink-input index.
 struct RoutedStream {

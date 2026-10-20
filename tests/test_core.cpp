@@ -467,6 +467,50 @@ void test_routing_links() {
     CHECK(pipeduck::missing_links(desired, desired).empty());
 }
 
+void test_routing_link_plan() {
+    g_current_test = "routing-link-plan";
+    const pipeduck::PortLink left{"pipeduck-1:monitor_FL", "alsa_output.foo:playback_FL"};
+    const pipeduck::PortLink right{"pipeduck-1:monitor_FR", "alsa_output.foo:playback_FR"};
+    const pipeduck::PortLink orphan{"pipeduck-1:monitor_FL", "alsa_output.old:playback_FL"};
+
+    {
+        // A retry after a partially completed first attempt only creates the
+        // link that is still missing.
+        const auto plan = pipeduck::plan_link_changes({left, right}, {left}, {left});
+        CHECK(plan.create.size() == 1);
+        CHECK((plan.create[0] == right));
+        CHECK(plan.remove.empty());
+    }
+    {
+        // Links this session created but no longer desires are slated for
+        // removal, while desired links are left alone.
+        const auto plan = pipeduck::plan_link_changes({left}, {left, orphan}, {left, orphan});
+        CHECK(plan.create.empty());
+        CHECK(plan.remove.size() == 1);
+        CHECK((plan.remove[0] == orphan));
+    }
+    {
+        // A desired link that already exists is not created again, and is not
+        // adopted as owned just because it is present.
+        const auto plan = pipeduck::plan_link_changes({left}, {}, {left});
+        CHECK(plan.create.empty());
+        CHECK(plan.remove.empty());
+    }
+    {
+        // Nothing desired and nothing existing still releases ownership so
+        // teardown does not leak a stale link.
+        const auto plan = pipeduck::plan_link_changes({}, {left}, {});
+        CHECK(plan.create.empty());
+        CHECK(plan.remove.size() == 1);
+        CHECK((plan.remove[0] == left));
+    }
+    {
+        const auto plan = pipeduck::plan_link_changes({}, {}, {});
+        CHECK(plan.create.empty());
+        CHECK(plan.remove.empty());
+    }
+}
+
 void test_routed_stream_identity() {
     g_current_test = "routed-stream-identity";
     const auto input = [](uint32_t index, uint32_t sink, const std::string& serial,
@@ -881,6 +925,7 @@ int main() {
     test_vad();
     test_routing_ports();
     test_routing_links();
+    test_routing_link_plan();
     test_routed_stream_identity();
     test_routed_stream_reconcile();
     test_restore_routed_streams();

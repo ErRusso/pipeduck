@@ -141,6 +141,18 @@ std::vector<PortLink> missing_links(const std::vector<PortLink>& desired,
     return result;
 }
 
+LinkPlan plan_link_changes(const std::vector<PortLink>& desired, const std::vector<PortLink>& owned,
+                           const std::vector<PortLink>& existing) {
+    LinkPlan plan;
+    plan.create = missing_links(desired, existing);
+    for (const auto& link : owned) {
+        if (std::find(desired.begin(), desired.end(), link) == desired.end()) {
+            plan.remove.push_back(link);
+        }
+    }
+    return plan;
+}
+
 std::string describe_cleanup(const RouteCleanupResult& result) {
     if (result.complete) {
         return "all routed streams restored";
@@ -449,7 +461,8 @@ bool RouteSession::ensure_monitor_links() {
     try {
         const std::string listing = run_command_checked("pw-link", {"-l"}, kLinkTimeout);
         const auto existing = parse_link_list(listing);
-        for (const auto& link : missing_links(impl_->monitor_links, existing)) {
+        const auto plan = plan_link_changes(impl_->monitor_links, impl_->monitor_links, existing);
+        for (const auto& link : plan.create) {
             create_link(link);
         }
         return true;
@@ -672,25 +685,34 @@ RouteSession RoutingEngine::start(const RoutingOptions& options) {
                 last_error = std::string("could not list existing links: ") + error.what();
             }
 
-            for (const auto& link : missing_links(desired, existing)) {
+            const auto plan = plan_link_changes(desired, impl.monitor_links, existing);
+
+            // Keep links we still need, and drop ownership only after a link was
+            // actually removed. A failed removal stays owned so teardown retries
+            // it instead of leaking the link.
+            std::vector<PortLink> next_owned;
+            for (const auto& link : impl.monitor_links) {
+                if (std::find(desired.begin(), desired.end(), link) != desired.end()) {
+                    next_owned.push_back(link);
+                }
+            }
+            for (const auto& link : plan.remove) {
+                try {
+                    unlink_port(link);
+                } catch (const std::exception&) {
+                    next_owned.push_back(link);
+                }
+            }
+            impl.monitor_links = std::move(next_owned);
+            for (const auto& link : plan.create) {
                 create_link(link);
+                // Record each link as soon as it exists, so a later failure and
+                // retry never loses track of a partial attempt.
                 if (std::find(impl.monitor_links.begin(), impl.monitor_links.end(), link) ==
                     impl.monitor_links.end()) {
                     impl.monitor_links.push_back(link);
                 }
             }
-            // Keep only the links this session owns, so a retry after a partial
-            // failure does not try to tear down a link it never created. Links
-            // from an earlier attempt that are no longer desired are removed.
-            for (const auto& old : impl.monitor_links) {
-                if (std::find(desired.begin(), desired.end(), old) == desired.end()) {
-                    try {
-                        unlink_port(old);
-                    } catch (const std::exception&) {
-                    }
-                }
-            }
-            impl.monitor_links = desired;
             impl.routing_started = true;
             break;
         } catch (const std::exception& error) {
