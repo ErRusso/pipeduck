@@ -144,9 +144,8 @@ DuckingSettings DuckingSettings::normalized() const {
     DuckingSettings result = *this;
     result.duck_percent = std::clamp(result.duck_percent, 0, 100);
     const double vad_fallback = DuckingSettings{}.vad_threshold;
-    result.vad_threshold =
-        std::clamp(std::isfinite(result.vad_threshold) ? result.vad_threshold : vad_fallback,
-                   0.0025, 0.2);
+    result.vad_threshold = std::clamp(
+        std::isfinite(result.vad_threshold) ? result.vad_threshold : vad_fallback, 0.0025, 0.2);
     result.mic_vad_threshold = std::clamp(
         std::isfinite(result.mic_vad_threshold) ? result.mic_vad_threshold : vad_fallback, 0.0025,
         0.2);

@@ -101,9 +101,56 @@ Used for the single-instance tray lock.
 .TP
 .B PIPEDUCK_ICON_THEME_PATH
 Overrides the icon theme search path.
+.SH DIAGNOSTICS
+The tray reports
+.BR Waiting ,
+.BR Ready ,
+.B Ducked ,
+.BR Recovering ,
+.BR Degraded ,
+.B NeedsAttention
+or
+.B Off.
+Only
+.B Ready
+and
+.B Ducked
+mean that audio is actively being ducked (a configured source may also be
+.B Waiting
+to appear).
+.PP
+Configuration values must be finite. Values such as
+.I nan
+or
+.I inf
+are rejected, and the running tray keeps the last valid settings. Missing
+.B pactl
+or
+.B pw-link
+executables, a lost PipeWire/PulseAudio backend, and a disappeared virtual sink
+or monitor link are reported as routing failures instead of being treated as
+normal operation. Recovery is attempted against the current default output with
+bounded backoff.
+.SH RECOVERY
+On shutdown, every stream moved by PipeDuck is restored using its recorded
+identity (object serial, node name or application label), so a reused sink-input
+index is not moved by mistake. The default sink is not changed back.
+.PP
+If a stream cannot be moved away safely, the virtual sink is left alive and its
+stream indices are reported. This avoids terminating application audio.
+.B pipeduck route
+and
+.B pipeduck route-once
+then exit with status 1 instead of claiming a clean restore. The abandoned sink
+belongs to the PipeDuck process; when the process exits, PipeWire removes it and
+normally moves remaining streams to the current default output. Inspect and
+repair manual leftovers with
+.B pactl list sink-inputs short
+and
+.BR "pactl move-sink-input" .
 .SH EXIT STATUS
 0 on success, 1 on error. Diagnostic routing commands also return 1 when the
-safety flag is missing.
+safety flag is missing or when cleanup could not restore every stream.
 .SH SEE ALSO
 .BR pactl (1),
 .BR pw-link (1),
