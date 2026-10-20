@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cmath>
 #include <csignal>
 #include <cstdlib>
@@ -247,6 +248,41 @@ void test_config_file_roundtrip() {
     const pipeduck::Config loaded = pipeduck::Config::load();
     CHECK(loaded.duck_percent == 42);
     CHECK(loaded.trigger == pipeduck::Trigger::Mic);
+
+    // Several writers using the same config path must never expose a partial
+    // file or leave a temporary sidecar behind.
+    std::atomic<int> save_failures{0};
+    std::vector<std::thread> writers;
+    for (int writer = 0; writer < 4; ++writer) {
+        writers.emplace_back([writer, &save_failures]() {
+            for (int iteration = 0; iteration < 25; ++iteration) {
+                try {
+                    pipeduck::Config concurrent = pipeduck::Config::defaults();
+                    concurrent.duck_percent = (writer * 25 + iteration) % 101;
+                    concurrent.save();
+                } catch (const std::exception& error) {
+                    std::cerr << "concurrent save failed: " << error.what() << "\n";
+                    ++save_failures;
+                }
+            }
+        });
+    }
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    CHECK(save_failures.load() == 0);
+    for (int read = 0; read < 50; ++read) {
+        try {
+            const auto concurrent = pipeduck::Config::load();
+            CHECK(concurrent.duck_percent >= 0 && concurrent.duck_percent <= 100);
+        } catch (const std::exception& error) {
+            std::cerr << "concurrent load failed: " << error.what() << "\n";
+            CHECK(false);
+        }
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(temporary / "pipeduck")) {
+        CHECK(entry.path().filename().string().find(".tmp.") == std::string::npos);
+    }
 
     std::filesystem::remove_all(temporary);
     unsetenv("XDG_CONFIG_HOME");
