@@ -3,10 +3,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "pipeduck/cli.hpp"
 #include "pipeduck/common.hpp"
 #include "pipeduck/config.hpp"
 #include "pipeduck/duck.hpp"
@@ -44,6 +46,16 @@ std::string g_current_test;
             ++g_failures;                                                                          \
         }                                                                                          \
     } while (false)
+
+pipeduck::CliOptions parse_arguments(std::initializer_list<std::string> values) {
+    std::vector<std::string> storage(values);
+    std::vector<char*> argv;
+    argv.reserve(storage.size());
+    for (auto& value : storage) {
+        argv.push_back(value.data());
+    }
+    return pipeduck::parse_cli(static_cast<int>(argv.size()), argv.data());
+}
 
 void test_common() {
     g_current_test = "common";
@@ -141,6 +153,34 @@ mic_vad_threshold = 0.0250
     CHECK(pipeduck::parse_trigger("MIC") == pipeduck::Trigger::Mic);
     CHECK(pipeduck::parse_trigger("call+mic") == pipeduck::Trigger::Both);
     CHECK_THROW(pipeduck::parse_trigger("nonsense"));
+
+    for (const char* value : {"nan", "NaN", "inf", "-inf", "infinity"}) {
+        CHECK_THROW(pipeduck::Config::parse(std::string("vad_threshold = ") + value));
+        CHECK_THROW(pipeduck::Config::parse(std::string("mic_vad_threshold = ") + value));
+    }
+    CHECK_THROW(pipeduck::Config::parse("vad_threshold = 0.01 trailing"));
+    CHECK_THROW(pipeduck::Config::parse("vad_threshold ="));
+
+    pipeduck::Config nonfinite = pipeduck::Config::defaults();
+    nonfinite.vad_threshold = std::nan("");
+    nonfinite.mic_vad_threshold = std::numeric_limits<double>::infinity();
+    const auto repaired = nonfinite.normalized();
+    CHECK(std::isfinite(repaired.vad_threshold));
+    CHECK(!repaired.mic_vad_threshold.has_value());
+
+    pipeduck::DuckingSettings nonfinite_settings;
+    nonfinite_settings.vad_threshold = std::nan("");
+    nonfinite_settings.mic_vad_threshold = -std::numeric_limits<double>::infinity();
+    const auto repaired_settings = nonfinite_settings.normalized();
+    CHECK(std::isfinite(repaired_settings.vad_threshold));
+    CHECK(std::isfinite(repaired_settings.mic_vad_threshold));
+
+    CHECK_THROW(parse_arguments({"pipeduck", "--vad-threshold", "nan"}));
+    CHECK_THROW(parse_arguments({"pipeduck", "--mic-vad-threshold", "inf"}));
+    CHECK_THROW(parse_arguments({"pipeduck", "--vad-threshold", "0.01junk"}));
+    const auto parsed_cli = parse_arguments({"pipeduck", "--vad-threshold", "0.02"});
+    CHECK(parsed_cli.vad_threshold.has_value());
+    CHECK(std::abs(*parsed_cli.vad_threshold - 0.02) < 1e-9);
 
     pipeduck::Config clamped = config;
     clamped.duck_percent = 400;

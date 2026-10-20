@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -132,8 +133,13 @@ std::optional<CallTarget> find_call_target(const std::vector<SinkInput>& inputs,
 DuckingSettings DuckingSettings::normalized() const {
     DuckingSettings result = *this;
     result.duck_percent = std::clamp(result.duck_percent, 0, 100);
-    result.vad_threshold = std::clamp(result.vad_threshold, 0.0025, 0.2);
-    result.mic_vad_threshold = std::clamp(result.mic_vad_threshold, 0.0025, 0.2);
+    const double vad_fallback = DuckingSettings{}.vad_threshold;
+    result.vad_threshold =
+        std::clamp(std::isfinite(result.vad_threshold) ? result.vad_threshold : vad_fallback,
+                   0.0025, 0.2);
+    result.mic_vad_threshold = std::clamp(
+        std::isfinite(result.mic_vad_threshold) ? result.mic_vad_threshold : vad_fallback, 0.0025,
+        0.2);
     result.hold_ms = std::clamp(result.hold_ms, 0, 4000);
     result.attack_fade_ms = std::clamp(result.attack_fade_ms, 0, 2000);
     result.release_fade_ms = std::clamp(result.release_fade_ms, 0, 3000);

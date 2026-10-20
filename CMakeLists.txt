@@ -51,6 +51,7 @@ add_custom_target(pipeduck_icons DEPENDS "${ICON_HEADER}")
 add_library(pipeduck_core STATIC
     src/common.cpp
     src/config.cpp
+    src/cli.cpp
     src/identity.cpp
     src/vad.cpp
     src/pulse.cpp
@@ -72,7 +73,6 @@ target_compile_options(pipeduck_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(pipeduck
     src/main.cpp
-    src/cli.cpp
     src/tray.cpp
     src/tune.cpp
 )

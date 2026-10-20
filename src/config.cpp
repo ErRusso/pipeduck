@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -87,16 +88,25 @@ int parse_int(const std::string& value, int line_number) {
 }
 
 double parse_double(const std::string& value, int line_number) {
+    std::size_t consumed = 0;
+    double result = 0.0;
     try {
-        std::size_t consumed = 0;
-        const double result = std::stod(value, &consumed);
-        if (consumed != value.size()) {
-            throw std::invalid_argument("trailing characters");
-        }
-        return result;
+        result = std::stod(value, &consumed);
     } catch (const std::exception&) {
         throw std::runtime_error("line " + std::to_string(line_number) + ": expected a number");
     }
+    if (consumed != value.size()) {
+        throw std::runtime_error("line " + std::to_string(line_number) + ": expected a number");
+    }
+    if (!std::isfinite(result)) {
+        throw std::runtime_error("line " + std::to_string(line_number) +
+                                 ": expected a finite number");
+    }
+    return result;
+}
+
+double finite_or(double value, double fallback) {
+    return std::isfinite(value) ? value : fallback;
 }
 
 std::string quote(const std::string& value) {
@@ -185,9 +195,15 @@ Config Config::defaults() {
 Config Config::normalized() const {
     Config result = *this;
     result.duck_percent = std::clamp(result.duck_percent, 0, 100);
-    result.vad_threshold = std::clamp(result.vad_threshold, 0.0025, 0.2);
+    result.vad_threshold = std::clamp(finite_or(result.vad_threshold, 0.01), 0.0025, 0.2);
     if (result.mic_vad_threshold.has_value()) {
-        result.mic_vad_threshold = std::clamp(*result.mic_vad_threshold, 0.0025, 0.2);
+        if (!std::isfinite(*result.mic_vad_threshold)) {
+            // An invalid optional value falls back to vad_threshold, matching
+            // the "unset" behavior used by older configurations.
+            result.mic_vad_threshold.reset();
+        } else {
+            result.mic_vad_threshold = std::clamp(*result.mic_vad_threshold, 0.0025, 0.2);
+        }
     }
     result.hold_ms = std::clamp(result.hold_ms, 0, 4000);
     result.attack_fade_ms = std::clamp(result.attack_fade_ms, 0, 2000);
