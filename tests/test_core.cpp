@@ -1,4 +1,5 @@
 #include <cmath>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -77,6 +78,35 @@ void test_common() {
     const auto timed_out = pipeduck::run_command("sleep", {"5"}, std::chrono::milliseconds(100));
     CHECK(timed_out.timed_out);
     CHECK(timed_out.exit_code == 124);
+
+    // The child closes both pipes immediately and then hangs. The timeout must
+    // still be enforced after the pipes are gone.
+    const auto start = std::chrono::steady_clock::now();
+    const auto closed_pipes = pipeduck::run_command(
+        "sh", {"-c", "exec >/dev/null 2>&1; sleep 5"}, std::chrono::milliseconds(150));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    CHECK(closed_pipes.timed_out);
+    CHECK(closed_pipes.exit_code == 124);
+    CHECK(elapsed < 2000);
+
+    bool timeout_message = false;
+    try {
+        (void)pipeduck::run_command_checked("sh", {"-c", "exec >/dev/null 2>&1; sleep 5"},
+                                            std::chrono::milliseconds(100));
+    } catch (const std::exception& error) {
+        timeout_message =
+            std::string(error.what()).find("timed out after 100 ms") != std::string::npos;
+    }
+    CHECK(timeout_message);
+
+    CHECK_THROW(pipeduck::run_command_checked("pipeduck-no-such-executable", {},
+                                              std::chrono::milliseconds(100)));
+
+    const auto signaled = pipeduck::run_command("sh", {"-c", "kill -TERM $$"},
+                                                std::chrono::milliseconds(1000));
+    CHECK(signaled.exit_code == 128 + SIGTERM);
 }
 
 void test_config() {
