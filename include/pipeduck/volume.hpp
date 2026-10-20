@@ -19,7 +19,10 @@ public:
     VolumeController& operator=(const VolumeController&) = delete;
 
     bool native() const;
-    void set_percent(const std::string& source_name, double percent);
+    // Returns true when the update was submitted. The optional subprocess
+    // fallback must stay disabled on the time-sensitive control tick.
+    bool set_percent(const std::string& source_name, double percent,
+                     bool allow_subprocess_fallback = true);
 
 private:
     struct Impl;

@@ -59,6 +59,7 @@ add_library(pipeduck_core STATIC
     src/pipewire.cpp
     src/routing.cpp
     src/duck.cpp
+    src/tray_state.cpp
     src/icons.cpp
 )
 add_dependencies(pipeduck_core pipeduck_icons)

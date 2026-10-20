@@ -105,17 +105,185 @@ std::vector<PortLink> monitor_links_for_ports(const std::string& outputs, const 
     return links;
 }
 
+std::vector<PortLink> parse_link_list(const std::string& listing) {
+    std::vector<PortLink> links;
+    std::string current;
+    for (const auto& raw_line : split_lines(listing)) {
+        const std::string line = trim(raw_line);
+        if (line.empty()) {
+            continue;
+        }
+        if (starts_with(line, "|->") || starts_with(line, "|<-")) {
+            const std::string other = trim(line.substr(3));
+            if (current.empty() || other.empty()) {
+                continue;
+            }
+            if (starts_with(line, "|->")) {
+                links.push_back({current, other});
+            } else {
+                links.push_back({other, current});
+            }
+            continue;
+        }
+        current = line;
+    }
+    return links;
+}
+
+std::vector<PortLink> missing_links(const std::vector<PortLink>& desired,
+                                    const std::vector<PortLink>& existing) {
+    std::vector<PortLink> result;
+    for (const auto& link : desired) {
+        if (std::find(existing.begin(), existing.end(), link) == existing.end()) {
+            result.push_back(link);
+        }
+    }
+    return result;
+}
+
+std::string describe_cleanup(const RouteCleanupResult& result) {
+    if (result.complete) {
+        return "all routed streams restored";
+    }
+    std::string message =
+        result.detail.empty() ? "could not restore every routed stream" : result.detail;
+    if (result.inspection_failed) {
+        message += " (could not inspect the audio graph)";
+    }
+    if (!result.failed_inputs.empty()) {
+        message += " (streams:";
+        for (const uint32_t index : result.failed_inputs) {
+            message += " #" + std::to_string(index);
+        }
+        message += ")";
+    }
+    if (!result.skipped_inputs.empty()) {
+        message += " (skipped:";
+        for (const uint32_t index : result.skipped_inputs) {
+            message += " #" + std::to_string(index);
+        }
+        message += ")";
+    }
+    if (result.sink_left_alive) {
+        message += "; the virtual sink was left alive to avoid terminating audio";
+    }
+    return message;
+}
+
+RoutedStream routed_stream_from_input(const SinkInput& input, uint32_t original_sink) {
+    RoutedStream stream;
+    stream.index = input.index;
+    stream.original_sink = original_sink;
+    stream.label = source_label(input.identity());
+    const auto serial = input.properties.find("object.serial");
+    if (serial != input.properties.end()) {
+        stream.object_serial = serial->second;
+    }
+    const auto node = input.properties.find("node.name");
+    if (node != input.properties.end()) {
+        stream.node_name = node->second;
+    }
+    return stream;
+}
+
+bool RoutedStream::matches(const SinkInput& input) const {
+    if (!object_serial.empty()) {
+        const auto serial = input.properties.find("object.serial");
+        return serial != input.properties.end() && serial->second == object_serial;
+    }
+    if (!node_name.empty()) {
+        const auto node = input.properties.find("node.name");
+        return node != input.properties.end() && node->second == node_name;
+    }
+    // Older servers may not expose a stable serial or node name. The label is
+    // the best remaining fingerprint; a mismatch is safer than moving an
+    // unrelated stream.
+    return !label.empty() && source_label(input.identity()) == label;
+}
+
+std::vector<RoutedStream> reconcile_routed_streams(std::vector<RoutedStream> routed,
+                                                   const std::vector<SinkInput>& current,
+                                                   uint32_t virtual_sink_index) {
+    std::vector<RoutedStream> result;
+    result.reserve(routed.size());
+    for (auto& stream : routed) {
+        const auto found =
+            std::find_if(current.begin(), current.end(),
+                         [&stream](const auto& input) { return input.index == stream.index; });
+        if (found == current.end()) {
+            continue;
+        }
+        if (found->sink != virtual_sink_index) {
+            continue;
+        }
+        if (!stream.matches(*found)) {
+            continue;
+        }
+        result.push_back(std::move(stream));
+    }
+    return result;
+}
+
+RestorePassResult
+restore_routed_streams(std::vector<RoutedStream>& routed, const std::vector<SinkInput>& current,
+                       uint32_t virtual_sink_index,
+                       const std::function<bool(uint32_t, uint32_t)>& move_to_index,
+                       const std::function<bool(uint32_t, const std::string&)>& move_to_name,
+                       const std::string& fallback_sink_name) {
+    RestorePassResult result;
+    for (auto stream = routed.begin(); stream != routed.end();) {
+        const auto found =
+            std::find_if(current.begin(), current.end(),
+                         [&stream](const auto& input) { return input.index == stream->index; });
+        if (found == current.end()) {
+            result.skipped.push_back(stream->index);
+            stream = routed.erase(stream);
+            continue;
+        }
+        if (!stream->matches(*found)) {
+            // The server reused this index for another stream. Never move it.
+            result.skipped.push_back(stream->index);
+            stream = routed.erase(stream);
+            continue;
+        }
+        if (found->sink != virtual_sink_index) {
+            // Already restored or moved by the user.
+            result.skipped.push_back(stream->index);
+            stream = routed.erase(stream);
+            continue;
+        }
+
+        ++result.attempted;
+        const bool moved = move_to_index(stream->index, stream->original_sink) ||
+                           move_to_name(stream->index, fallback_sink_name);
+        if (moved) {
+            result.restored.push_back(stream->index);
+            stream = routed.erase(stream);
+        } else {
+            result.failed.push_back(stream->index);
+            ++stream;
+        }
+    }
+    return result;
+}
+
 struct RouteSession::Impl {
     std::unique_ptr<VirtualSink> virtual_sink;
     std::string virtual_sink_name;
     uint32_t virtual_sink_index = 0;
     std::string real_sink_name;
     uint32_t real_sink_index = 0;
-    std::map<uint32_t, uint32_t> moved_inputs;
+    std::vector<RoutedStream> routed_inputs;
     std::vector<PortLink> monitor_links;
     std::unique_ptr<VolumeController> volume;
     VolumeRamp ramp;
+    // The last fade value the backend rejected. Retried from tick_ramp() so a
+    // transient backend loss does not silently leave the wrong volume applied.
+    bool pending_volume = false;
+    double pending_percent = 100.0;
+    bool routing_started = false;
     bool stopped = false;
+    RouteCleanupResult cleanup_result;
 
     std::string monitor_source_name() const {
         return virtual_sink_name + ".monitor";
@@ -141,30 +309,55 @@ const std::string& RouteSession::real_sink_name() const {
     return impl_->real_sink_name;
 }
 
-void RouteSession::set_percent(double percent) {
-    if (impl_ == nullptr || impl_->stopped) {
-        return;
+bool RouteSession::set_percent(double percent, bool allow_subprocess_fallback) {
+    if (impl_ == nullptr || impl_->stopped || impl_->volume == nullptr) {
+        return false;
     }
-    impl_->volume->set_percent(impl_->monitor_source_name(), percent);
+    if (!impl_->volume->set_percent(impl_->monitor_source_name(), percent,
+                                    allow_subprocess_fallback)) {
+        return false;
+    }
     volume_percent_ = percent;
+    impl_->pending_volume = false;
+    return true;
 }
 
-void RouteSession::start_ramp(double percent, int duration_ms) {
+bool RouteSession::start_ramp(double percent, int duration_ms) {
     if (impl_ == nullptr || impl_->stopped) {
-        return;
+        return false;
     }
     impl_->ramp.start(volume_percent_, percent, duration_ms);
     if (!impl_->ramp.active()) {
-        set_percent(percent);
+        const bool applied = set_percent(percent);
+        if (!applied) {
+            impl_->pending_percent = percent;
+            impl_->pending_volume = true;
+        }
+        return applied;
     }
+    impl_->pending_volume = false;
+    return true;
 }
 
-void RouteSession::tick_ramp() {
-    if (impl_ == nullptr || impl_->stopped || !impl_->ramp.active()) {
-        return;
+bool RouteSession::tick_ramp() {
+    if (impl_ == nullptr || impl_->stopped) {
+        return true;
+    }
+    if (!impl_->ramp.active()) {
+        // Retry a value that the backend rejected, even after the fade itself
+        // has finished, so recovery is not limited to the fade duration.
+        if (!impl_->pending_volume) {
+            return true;
+        }
+        return set_percent(impl_->pending_percent);
     }
     const double value = impl_->ramp.update();
-    set_percent(value);
+    const bool applied = set_percent(value);
+    if (!applied) {
+        impl_->pending_percent = value;
+        impl_->pending_volume = true;
+    }
+    return applied;
 }
 
 bool RouteSession::ramp_active() const {
@@ -175,7 +368,10 @@ void RouteSession::ramp_to(double percent, int duration_ms, const std::atomic<bo
     if (impl_ == nullptr || impl_->stopped) {
         return;
     }
-    start_ramp(percent, duration_ms);
+    if (!start_ramp(percent, duration_ms)) {
+        set_percent(percent, true);
+        return;
+    }
     while (impl_->ramp.active()) {
         if (stop != nullptr && stop->load()) {
             impl_->ramp.cancel();
@@ -190,8 +386,13 @@ void RouteSession::set_neutral(int fade_ms) {
     if (fade_ms > 0) {
         ramp_to(100.0, fade_ms);
     } else {
-        set_percent(100.0);
+        set_percent(100.0, true);
     }
+}
+
+const RouteCleanupResult& RouteSession::cleanup_result() const {
+    static const RouteCleanupResult empty;
+    return impl_ != nullptr ? impl_->cleanup_result : empty;
 }
 
 std::size_t
@@ -200,8 +401,11 @@ RouteSession::route_existing_outputs(const std::optional<ConfiguredSource>& voic
         return 0;
     }
     const PulseCtl pulse;
+    const auto inputs = pulse.sink_inputs();
+    impl_->routed_inputs = reconcile_routed_streams(std::move(impl_->routed_inputs), inputs,
+                                                    impl_->virtual_sink_index);
     std::size_t moved = 0;
-    for (const auto& input : pulse.sink_inputs()) {
+    for (const auto& input : inputs) {
         const AudioIdentity identity = input.identity();
         if (!identity.is_playback_stream()) {
             continue;
@@ -210,15 +414,25 @@ RouteSession::route_existing_outputs(const std::optional<ConfiguredSource>& voic
             continue;
         }
         if (input.sink == impl_->virtual_sink_index) {
-            impl_->moved_inputs.emplace(input.index, impl_->real_sink_index);
+            const auto known = std::find_if(
+                impl_->routed_inputs.begin(), impl_->routed_inputs.end(),
+                [&input](const RoutedStream& stream) { return stream.index == input.index; });
+            if (known == impl_->routed_inputs.end()) {
+                // A stream that was already on our sink (for example, left by a
+                // previous session) is restored to the real sink on teardown.
+                impl_->routed_inputs.push_back(
+                    routed_stream_from_input(input, impl_->real_sink_index));
+            }
             continue;
         }
         if (input.sink != impl_->real_sink_index) {
             continue;
         }
-        impl_->moved_inputs.emplace(input.index, input.sink);
         try {
             pulse.move_sink_input(input.index, impl_->virtual_sink_name);
+            // Record only after the move succeeds, so a failed move is never
+            // later presented as a successfully restored stream.
+            impl_->routed_inputs.push_back(routed_stream_from_input(input, input.sink));
             ++moved;
         } catch (const std::exception& error) {
             std::cerr << "pipeduck: could not route sink-input #" << input.index << ": "
@@ -228,62 +442,114 @@ RouteSession::route_existing_outputs(const std::optional<ConfiguredSource>& voic
     return moved;
 }
 
-void RouteSession::stop() {
-    if (impl_ == nullptr || impl_->stopped) {
-        return;
+bool RouteSession::ensure_monitor_links() {
+    if (impl_ == nullptr || impl_->stopped || impl_->virtual_sink == nullptr) {
+        return false;
     }
-    if (impl_->virtual_sink == nullptr) {
-        impl_->stopped = true;
-        impl_->volume.reset();
-        return;
+    try {
+        const std::string listing = run_command_checked("pw-link", {"-l"}, kLinkTimeout);
+        const auto existing = parse_link_list(listing);
+        for (const auto& link : missing_links(impl_->monitor_links, existing)) {
+            create_link(link);
+        }
+        return true;
+    } catch (const std::exception& error) {
+        std::cerr << "pipeduck: could not verify monitor links: " << error.what() << "\n";
+        return false;
     }
-    if (impl_->volume != nullptr) {
-        impl_->volume->set_percent(impl_->monitor_source_name(), 100.0);
-        volume_percent_ = 100.0;
+}
+
+RouteCleanupResult RouteSession::stop() {
+    if (impl_ == nullptr) {
+        return {};
+    }
+    if (impl_->stopped) {
+        return impl_->cleanup_result;
     }
     impl_->stopped = true;
+
+    RouteCleanupResult result;
+    if (impl_->virtual_sink == nullptr) {
+        impl_->volume.reset();
+        impl_->cleanup_result = result;
+        return result;
+    }
+
+    if (impl_->volume != nullptr) {
+        impl_->volume->set_percent(impl_->monitor_source_name(), 100.0, true);
+        volume_percent_ = 100.0;
+    }
+
     const PulseCtl pulse;
+    const auto move_to_index = [&pulse, this](uint32_t index, uint32_t sink_index) {
+        try {
+            // Sink indices can be reused too. Only use the original index while
+            // it still refers to the sink the session started with; otherwise
+            // fall back to the recorded name.
+            const auto sink = pulse.sink_by_index(sink_index);
+            if (!sink.has_value() || sink->name != impl_->real_sink_name) {
+                return false;
+            }
+            pulse.move_sink_input_to_index(index, sink_index);
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+    const auto move_to_name = [&pulse](uint32_t index, const std::string& sink_name) {
+        try {
+            pulse.move_sink_input(index, sink_name);
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+    const auto add_unique = [](std::vector<uint32_t>& values, uint32_t value) {
+        if (std::find(values.begin(), values.end(), value) == values.end()) {
+            values.push_back(value);
+        }
+    };
+
     // Never restore the captured default here: the user may have switched
     // outputs while ducking was active. Only the streams we moved are restored.
-
-    try {
-        for (const auto& input : pulse.sink_inputs_on_sink(impl_->virtual_sink_index)) {
-            impl_->moved_inputs.emplace(input.index, impl_->real_sink_index);
-        }
-    } catch (const std::exception& error) {
-        std::cerr << "pipeduck: could not inspect routed streams: " << error.what() << "\n";
-    }
-
-    for (const auto& [input_index, original_sink] : impl_->moved_inputs) {
-        try {
-            pulse.move_sink_input_to_index(input_index, original_sink);
-        } catch (const std::exception&) {
-            try {
-                pulse.move_sink_input(input_index, impl_->real_sink_name);
-            } catch (const std::exception& error) {
-                std::cerr << "pipeduck: could not restore sink-input #" << input_index << ": "
-                          << error.what() << "\n";
-            }
-        }
-    }
-
-    bool empty = false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    std::vector<uint32_t> remaining;
     for (;;) {
+        std::vector<SinkInput> current;
         try {
-            const auto remaining = pulse.sink_inputs_on_sink(impl_->virtual_sink_index);
-            if (remaining.empty()) {
-                empty = true;
+            current = pulse.sink_inputs();
+            result.inspection_failed = false;
+            result.detail.clear();
+        } catch (const std::exception& error) {
+            result.inspection_failed = true;
+            result.detail = std::string("could not inspect routed streams: ") + error.what();
+            if (std::chrono::steady_clock::now() >= deadline) {
                 break;
             }
-            for (const auto& input : remaining) {
-                impl_->moved_inputs.emplace(input.index, impl_->real_sink_index);
-                try {
-                    pulse.move_sink_input(input.index, impl_->real_sink_name);
-                } catch (const std::exception&) {
-                }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        impl_->routed_inputs = reconcile_routed_streams(std::move(impl_->routed_inputs), current,
+                                                        impl_->virtual_sink_index);
+        const RestorePassResult pass =
+            restore_routed_streams(impl_->routed_inputs, current, impl_->virtual_sink_index,
+                                   move_to_index, move_to_name, impl_->real_sink_name);
+        for (const uint32_t index : pass.skipped) {
+            add_unique(result.skipped_inputs, index);
+        }
+        for (const uint32_t index : pass.failed) {
+            add_unique(result.failed_inputs, index);
+        }
+
+        remaining.clear();
+        for (const auto& input : current) {
+            if (input.sink == impl_->virtual_sink_index) {
+                add_unique(remaining, input.index);
             }
-        } catch (const std::exception&) {
+        }
+        if (impl_->routed_inputs.empty() && remaining.empty()) {
+            break;
         }
         if (std::chrono::steady_clock::now() >= deadline) {
             break;
@@ -291,28 +557,65 @@ void RouteSession::stop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    if (!empty) {
-        std::cerr << "pipeduck: warning: virtual sink " << impl_->virtual_sink_name
-                  << " still has streams; leaving it alive to avoid terminating audio\n";
-        impl_->virtual_sink->abandon();
-        impl_->volume.reset();
-        return;
+    if (result.inspection_failed) {
+        try {
+            if (!pulse.sink_by_name(impl_->virtual_sink_name).has_value()) {
+                // The backend restarted and our sink is gone, so no stream can
+                // still be attached to it. There is nothing left to restore.
+                result.inspection_failed = false;
+                result.complete = true;
+                result.detail = "the virtual sink disappeared with the audio backend";
+                impl_->volume.reset();
+                impl_->cleanup_result = result;
+                return result;
+            }
+        } catch (const std::exception&) {
+            // The backend is unreachable and we cannot prove the sink is gone.
+            // Keep the safety rule and leave it alone.
+        }
     }
 
+    if (!impl_->routed_inputs.empty() || !remaining.empty() || result.inspection_failed) {
+        result.complete = false;
+        result.sink_left_alive = true;
+        for (const uint32_t index : remaining) {
+            add_unique(result.failed_inputs, index);
+        }
+        if (result.detail.empty()) {
+            result.detail = "virtual sink still has " + std::to_string(remaining.size()) +
+                            " stream(s) that could not be moved";
+        }
+        std::cerr << "pipeduck: warning: " << describe_cleanup(result) << "\n";
+        impl_->virtual_sink->abandon();
+        impl_->volume.reset();
+        impl_->cleanup_result = result;
+        return result;
+    }
+
+    std::string unlink_error;
     for (const auto& link : impl_->monitor_links) {
         try {
             unlink_port(link);
         } catch (const std::exception& error) {
-            std::cerr << "pipeduck: could not remove monitor link: " << error.what() << "\n";
+            unlink_error = error.what();
         }
     }
     impl_->monitor_links.clear();
     try {
         impl_->virtual_sink->destroy();
     } catch (const std::exception& error) {
-        std::cerr << "pipeduck: could not destroy virtual sink: " << error.what() << "\n";
+        result.complete = false;
+        result.sink_left_alive = true;
+        result.detail = std::string("could not destroy the virtual sink: ") + error.what();
+    }
+    if (!unlink_error.empty() && result.detail.empty()) {
+        // Destroying the sink removes its links anyway, so this is diagnostic
+        // only and does not make the cleanup incomplete.
+        result.detail = "could not remove a monitor link: " + unlink_error;
     }
     impl_->volume.reset();
+    impl_->cleanup_result = result;
+    return result;
 }
 
 RoutingEngine::RoutingEngine(std::optional<ConfiguredSource> voice_source,
@@ -352,28 +655,65 @@ RouteSession RoutingEngine::start(const RoutingOptions& options) {
     }
 
     const auto deadline = std::chrono::steady_clock::now() + kPortAppearTimeout;
+    std::string last_error;
     for (;;) {
-        const std::string outputs = run_command_checked("pw-link", {"-o"}, kLinkTimeout);
-        const std::string inputs = run_command_checked("pw-link", {"-i"}, kLinkTimeout);
         try {
-            const auto links = monitor_links_for_ports(outputs, inputs, impl.virtual_sink_name,
-                                                       impl.real_sink_name);
-            for (const auto& link : links) {
-                create_link(link);
-                impl.monitor_links.push_back(link);
+            const std::string outputs = run_command_checked("pw-link", {"-o"}, kLinkTimeout);
+            const std::string inputs = run_command_checked("pw-link", {"-i"}, kLinkTimeout);
+            const auto desired = monitor_links_for_ports(outputs, inputs, impl.virtual_sink_name,
+                                                         impl.real_sink_name);
+
+            std::vector<PortLink> existing;
+            try {
+                existing = parse_link_list(run_command_checked("pw-link", {"-l"}, kLinkTimeout));
+            } catch (const std::exception& error) {
+                // Creating a link that already exists is harmless enough to retry
+                // on the next pass; keep the original error for diagnostics.
+                last_error = std::string("could not list existing links: ") + error.what();
             }
+
+            for (const auto& link : missing_links(desired, existing)) {
+                create_link(link);
+                if (std::find(impl.monitor_links.begin(), impl.monitor_links.end(), link) ==
+                    impl.monitor_links.end()) {
+                    impl.monitor_links.push_back(link);
+                }
+            }
+            // Keep only the links this session owns, so a retry after a partial
+            // failure does not try to tear down a link it never created. Links
+            // from an earlier attempt that are no longer desired are removed.
+            for (const auto& old : impl.monitor_links) {
+                if (std::find(desired.begin(), desired.end(), old) == desired.end()) {
+                    try {
+                        unlink_port(old);
+                    } catch (const std::exception&) {
+                    }
+                }
+            }
+            impl.monitor_links = desired;
+            impl.routing_started = true;
             break;
         } catch (const std::exception& error) {
+            last_error = error.what();
             if (std::chrono::steady_clock::now() >= deadline) {
-                throw std::runtime_error(
-                    "PipeWire ports for the virtual sink did not become available: " +
-                    std::string(error.what()));
+                // A startup failure must not leave partially created links behind.
+                for (const auto& link : impl.monitor_links) {
+                    try {
+                        unlink_port(link);
+                    } catch (const std::exception&) {
+                    }
+                }
+                impl.monitor_links.clear();
+                throw std::runtime_error("could not route the virtual sink through " +
+                                         impl.real_sink_name + ": " + last_error);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
 
-    session.set_percent(100.0);
+    if (!session.set_percent(100.0, true)) {
+        throw std::runtime_error("could not initialize the virtual sink monitor volume");
+    }
     session.route_existing_outputs(voice_source_);
     return session;
 }

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <csignal>
@@ -17,6 +18,7 @@
 #include "pipeduck/identity.hpp"
 #include "pipeduck/pulse.hpp"
 #include "pipeduck/routing.hpp"
+#include "pipeduck/tray_state.hpp"
 #include "pipeduck/vad.hpp"
 #include "pipeduck/volume.hpp"
 
@@ -83,8 +85,8 @@ void test_common() {
     // The child closes both pipes immediately and then hangs. The timeout must
     // still be enforced after the pipes are gone.
     const auto start = std::chrono::steady_clock::now();
-    const auto closed_pipes = pipeduck::run_command(
-        "sh", {"-c", "exec >/dev/null 2>&1; sleep 5"}, std::chrono::milliseconds(150));
+    const auto closed_pipes = pipeduck::run_command("sh", {"-c", "exec >/dev/null 2>&1; sleep 5"},
+                                                    std::chrono::milliseconds(150));
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now() - start)
                              .count();
@@ -105,8 +107,8 @@ void test_common() {
     CHECK_THROW(pipeduck::run_command_checked("pipeduck-no-such-executable", {},
                                               std::chrono::milliseconds(100)));
 
-    const auto signaled = pipeduck::run_command("sh", {"-c", "kill -TERM $$"},
-                                                std::chrono::milliseconds(1000));
+    const auto signaled =
+        pipeduck::run_command("sh", {"-c", "kill -TERM $$"}, std::chrono::milliseconds(1000));
     CHECK(signaled.exit_code == 128 + SIGTERM);
 }
 
@@ -331,12 +333,9 @@ void test_call_target() {
     pipeduck::SinkInput input;
     input.index = 42;
     input.properties = {
-        {"application.name", "Discord"},
-        {"application.process.binary", "discord"},
-        {"media.name", "playStream"},
-        {"media.class", "Stream/Output/Audio"},
-        {"object.serial", "99"},
-        {"node.name", "discord-call"},
+        {"application.name", "Discord"}, {"application.process.binary", "discord"},
+        {"media.name", "playStream"},    {"media.class", "Stream/Output/Audio"},
+        {"object.serial", "99"},         {"node.name", "discord-call"},
     };
     pipeduck::ConfiguredSource source;
     source.application_name = "Discord";
@@ -434,6 +433,222 @@ void test_routing_ports() {
     CHECK_THROW(pipeduck::monitor_links_for_ports("", "", "a", "b"));
 }
 
+void test_routing_links() {
+    g_current_test = "routing-links";
+    const std::string listing = "pipeduck-1:monitor_FL\n"
+                                "  |-> alsa_output.foo:playback_FL\n"
+                                "pipeduck-1:monitor_FR\n"
+                                "  |-> alsa_output.foo:playback_FR\n"
+                                "alsa_output.foo:playback_AUX0\n"
+                                "  |<- pipeduck-2:monitor_FL\n";
+    const auto parsed = pipeduck::parse_link_list(listing);
+    CHECK(parsed.size() == 3);
+    CHECK(
+        (parsed[0] == pipeduck::PortLink{"pipeduck-1:monitor_FL", "alsa_output.foo:playback_FL"}));
+    CHECK(
+        (parsed[1] == pipeduck::PortLink{"pipeduck-1:monitor_FR", "alsa_output.foo:playback_FR"}));
+    // A `|<-` row under an input port still normalizes to output -> input.
+    CHECK((parsed[2] ==
+           pipeduck::PortLink{"pipeduck-2:monitor_FL", "alsa_output.foo:playback_AUX0"}));
+    CHECK(pipeduck::parse_link_list("").empty());
+    CHECK(pipeduck::parse_link_list("  |-> orphan\n").empty());
+
+    const std::vector<pipeduck::PortLink> desired{
+        {"pipeduck-1:monitor_FL", "alsa_output.foo:playback_FL"},
+        {"pipeduck-1:monitor_FR", "alsa_output.foo:playback_FR"},
+    };
+    const std::vector<pipeduck::PortLink> existing{
+        {"pipeduck-1:monitor_FL", "alsa_output.foo:playback_FL"},
+        {"unrelated:out", "unrelated:in"},
+    };
+    const auto missing = pipeduck::missing_links(desired, existing);
+    CHECK(missing.size() == 1);
+    CHECK((missing[0] == desired[1]));
+    CHECK(pipeduck::missing_links(desired, desired).empty());
+}
+
+void test_routed_stream_identity() {
+    g_current_test = "routed-stream-identity";
+    const auto input = [](uint32_t index, uint32_t sink, const std::string& serial,
+                          const std::string& node) {
+        pipeduck::SinkInput value;
+        value.index = index;
+        value.sink = sink;
+        value.properties = {
+            {"application.name", "Discord"},
+            {"application.process.binary", "discord"},
+            {"media.name", "playStream"},
+            {"media.class", "Stream/Output/Audio"},
+        };
+        if (!serial.empty()) {
+            value.properties["object.serial"] = serial;
+        }
+        if (!node.empty()) {
+            value.properties["node.name"] = node;
+        }
+        return value;
+    };
+
+    const auto original = pipeduck::routed_stream_from_input(input(7, 3, "42", "discord-call"), 3);
+    CHECK(original.index == 7);
+    CHECK(original.original_sink == 3);
+    CHECK(original.object_serial == "42");
+    CHECK(original.node_name == "discord-call");
+    CHECK(original.label == "Discord / discord / playStream");
+    CHECK(original.matches(input(9, 8, "42", "renamed-node")));
+    CHECK(!original.matches(input(9, 8, "43", "discord-call")));
+
+    pipeduck::RoutedStream node_only;
+    node_only.index = 1;
+    node_only.node_name = "discord-call";
+    CHECK(node_only.matches(input(1, 8, "", "discord-call")));
+    CHECK(!node_only.matches(input(1, 8, "", "other")));
+
+    pipeduck::RoutedStream label_only;
+    label_only.index = 2;
+    label_only.label = "Discord / discord / playStream";
+    CHECK(label_only.matches(input(2, 8, "", "")));
+    pipeduck::SinkInput other = input(2, 8, "", "");
+    other.properties["application.name"] = "Firefox";
+    CHECK(!label_only.matches(other));
+
+    pipeduck::RoutedStream no_fingerprint;
+    no_fingerprint.index = 3;
+    CHECK(!no_fingerprint.matches(input(3, 8, "", "")));
+}
+
+void test_routed_stream_reconcile() {
+    g_current_test = "routed-stream-reconcile";
+    const auto make_routed = [](uint32_t index, const std::string& serial) {
+        pipeduck::RoutedStream stream;
+        stream.index = index;
+        stream.original_sink = 3;
+        stream.object_serial = serial;
+        return stream;
+    };
+    const auto make_input = [](uint32_t index, uint32_t sink, const std::string& serial) {
+        pipeduck::SinkInput input;
+        input.index = index;
+        input.sink = sink;
+        input.properties["object.serial"] = serial;
+        return input;
+    };
+
+    const uint32_t virtual_sink = 9;
+    auto routed = std::vector<pipeduck::RoutedStream>{make_routed(1, "11"), make_routed(2, "22"),
+                                                      make_routed(3, "33"), make_routed(4, "44")};
+    const std::vector<pipeduck::SinkInput> current{
+        make_input(1, virtual_sink, "11"), // still routed
+        make_input(2, 3, "22"),            // already restored
+        // 3 vanished
+        make_input(4, virtual_sink, "99"), // index reused by another stream
+    };
+    const auto kept = pipeduck::reconcile_routed_streams(routed, current, virtual_sink);
+    CHECK(kept.size() == 1);
+    CHECK(kept[0].index == 1);
+
+    CHECK(pipeduck::reconcile_routed_streams({}, current, virtual_sink).empty());
+}
+
+void test_restore_routed_streams() {
+    g_current_test = "restore-routed-streams";
+    const auto make_routed = [](uint32_t index, uint32_t original_sink, const std::string& serial) {
+        pipeduck::RoutedStream stream;
+        stream.index = index;
+        stream.original_sink = original_sink;
+        stream.object_serial = serial;
+        return stream;
+    };
+    const auto make_input = [](uint32_t index, uint32_t sink, const std::string& serial) {
+        pipeduck::SinkInput input;
+        input.index = index;
+        input.sink = sink;
+        input.properties["object.serial"] = serial;
+        return input;
+    };
+
+    const uint32_t virtual_sink = 9;
+    std::vector<pipeduck::RoutedStream> routed{
+        make_routed(1, 3, "11"), // restored by index
+        make_routed(2, 4, "22"), // index move fails, name fallback succeeds
+        make_routed(3, 5, "33"), // both moves fail
+        make_routed(4, 3, "44"), // vanished
+        make_routed(5, 3, "55"), // index reused by an unrelated stream
+        make_routed(6, 3, "66"), // user already moved it away
+    };
+    const std::vector<pipeduck::SinkInput> current{
+        make_input(1, virtual_sink, "11"),
+        make_input(2, virtual_sink, "22"),
+        make_input(3, virtual_sink, "33"),
+        make_input(5, virtual_sink, "different"),
+        make_input(6, 3, "66"),
+    };
+
+    std::vector<uint32_t> index_attempts;
+    std::vector<uint32_t> name_attempts;
+    const auto result = pipeduck::restore_routed_streams(
+        routed, current, virtual_sink,
+        [&index_attempts](uint32_t index, uint32_t) {
+            index_attempts.push_back(index);
+            return index == 1;
+        },
+        [&name_attempts](uint32_t index, const std::string& sink_name) {
+            name_attempts.push_back(index);
+            return sink_name == "real-sink" && index == 2;
+        },
+        "real-sink");
+
+    CHECK(result.attempted == 3);
+    CHECK(result.restored.size() == 2);
+    CHECK(result.restored[0] == 1);
+    CHECK(result.restored[1] == 2);
+    CHECK(result.failed.size() == 1);
+    CHECK(result.failed[0] == 3);
+    CHECK(result.skipped.size() == 3);
+    CHECK(std::find(result.skipped.begin(), result.skipped.end(), 4) != result.skipped.end());
+    CHECK(std::find(result.skipped.begin(), result.skipped.end(), 5) != result.skipped.end());
+    CHECK(std::find(result.skipped.begin(), result.skipped.end(), 6) != result.skipped.end());
+    CHECK(std::find(index_attempts.begin(), index_attempts.end(), 5) == index_attempts.end());
+    CHECK(std::find(name_attempts.begin(), name_attempts.end(), 5) == name_attempts.end());
+    CHECK(routed.size() == 1);
+    CHECK(routed[0].index == 3);
+
+    // A second pass retries only the stream that still failed.
+    index_attempts.clear();
+    name_attempts.clear();
+    const auto retry = pipeduck::restore_routed_streams(
+        routed, {make_input(3, virtual_sink, "33")}, virtual_sink,
+        [](uint32_t, uint32_t) { return false; },
+        [](uint32_t, const std::string&) { return false; }, "real-sink");
+    CHECK(retry.attempted == 1);
+    CHECK(retry.failed.size() == 1);
+    CHECK(routed.size() == 1);
+}
+
+void test_cleanup_description() {
+    g_current_test = "cleanup-description";
+    pipeduck::RouteCleanupResult clean;
+    CHECK(pipeduck::describe_cleanup(clean) == "all routed streams restored");
+
+    pipeduck::RouteCleanupResult partial;
+    partial.complete = false;
+    partial.sink_left_alive = true;
+    partial.failed_inputs = {12, 13};
+    partial.skipped_inputs = {14};
+    partial.detail = "virtual sink still has streams";
+    const std::string message = pipeduck::describe_cleanup(partial);
+    CHECK(message.find("virtual sink still has streams") != std::string::npos);
+    CHECK(message.find("#12") != std::string::npos);
+    CHECK(message.find("#13") != std::string::npos);
+    CHECK(message.find("skipped: #14") != std::string::npos);
+    CHECK(message.find("left alive") != std::string::npos);
+
+    pipeduck::RouteCleanupResult inspection;
+    inspection.complete = false;
+    inspection.inspection_failed = true;
+    CHECK(pipeduck::describe_cleanup(inspection).find("inspect") != std::string::npos);
+}
+
 void test_pulse_json() {
     g_current_test = "pulse-json";
     const std::string sinks = R"([
@@ -529,6 +744,113 @@ void test_nonblocking_ramp() {
     CHECK(std::abs(immediate.current() - 25.0) < 1e-9);
 }
 
+void test_tray_state() {
+    g_current_test = "tray-state";
+    using pipeduck::TrayState;
+
+    CHECK(!pipeduck::tray_state_visible(TrayState::Idle));
+    CHECK(!pipeduck::tray_state_visible(TrayState::Starting));
+    CHECK(!pipeduck::tray_state_visible(TrayState::Stopping));
+    CHECK(pipeduck::tray_state_visible(TrayState::Waiting));
+    CHECK(pipeduck::tray_state_visible(TrayState::Neutral));
+    CHECK(pipeduck::tray_state_visible(TrayState::Ducked));
+    CHECK(!pipeduck::tray_state_visible(TrayState::Recovering));
+    CHECK(!pipeduck::tray_state_visible(TrayState::Degraded));
+    CHECK(!pipeduck::tray_state_visible(TrayState::Error));
+    CHECK(pipeduck::tray_state_value(TrayState::Neutral) == "ON");
+    CHECK(pipeduck::tray_state_value(TrayState::Starting) == "OFF");
+
+    pipeduck::TrayStatus status;
+    pipeduck::DuckingEvent waiting;
+    waiting.type = pipeduck::DuckingEventType::WaitingForSource;
+    auto reduction = pipeduck::reduce_tray_event(status, waiting);
+    CHECK(reduction.changed);
+    CHECK(reduction.status.state == TrayState::Waiting);
+    CHECK(pipeduck::tray_state_visible(reduction.status.state));
+
+    // A failed startup must not be reported as Ducking ON.
+    pipeduck::DuckingEvent failure;
+    failure.type = pipeduck::DuckingEventType::RoutingFailed;
+    failure.message = "pw-link unavailable";
+    reduction = pipeduck::reduce_tray_event(reduction.status, failure);
+    CHECK(reduction.status.state == TrayState::Recovering);
+    CHECK(!pipeduck::tray_state_visible(reduction.status.state));
+    CHECK(pipeduck::tray_state_attention(reduction.status.state));
+    CHECK(reduction.status.message.find("pw-link unavailable") != std::string::npos);
+
+    // Only an established session clears recovery.
+    pipeduck::DuckingEvent recovering;
+    recovering.type = pipeduck::DuckingEventType::Recovering;
+    recovering.message = "rebuilding";
+    reduction = pipeduck::reduce_tray_event(reduction.status, recovering);
+    CHECK(reduction.status.state == TrayState::Recovering);
+
+    pipeduck::DuckingEvent started;
+    started.type = pipeduck::DuckingEventType::Started;
+    started.label = "#7 Discord / discord / playStream";
+    started.threshold = 0.01;
+    started.start_threshold = 0.02;
+    started.hold_ms = 700;
+    reduction = pipeduck::reduce_tray_event(reduction.status, started);
+    CHECK(reduction.status.state == TrayState::Neutral);
+    CHECK(!pipeduck::tray_state_attention(reduction.status.state));
+    CHECK(reduction.status.message.find("#7 Discord") != std::string::npos);
+    CHECK(pipeduck::tray_state_visible(reduction.status.state));
+
+    pipeduck::DuckingEvent active;
+    active.type = pipeduck::DuckingEventType::VoiceActive;
+    active.level = 0.42;
+    active.duck_percent = 25;
+    reduction = pipeduck::reduce_tray_event(reduction.status, active);
+    CHECK(reduction.status.state == TrayState::Ducked);
+    CHECK(reduction.status.message.find("25%") != std::string::npos);
+
+    pipeduck::DuckingEvent inactive;
+    inactive.type = pipeduck::DuckingEventType::VoiceInactive;
+    reduction = pipeduck::reduce_tray_event(reduction.status, inactive);
+    CHECK(reduction.status.state == TrayState::Neutral);
+
+    // A degraded session is surfaced instead of showing a healthy Ducked/ON.
+    pipeduck::DuckingEvent degraded;
+    degraded.type = pipeduck::DuckingEventType::Degraded;
+    degraded.message = "volume backend lost";
+    reduction = pipeduck::reduce_tray_event(reduction.status, degraded);
+    CHECK(reduction.status.state == TrayState::Degraded);
+    CHECK(!pipeduck::tray_state_visible(reduction.status.state));
+    reduction = pipeduck::reduce_tray_event(reduction.status, started);
+    CHECK(reduction.status.state == TrayState::Neutral);
+
+    // A plain message keeps the current state.
+    pipeduck::DuckingEvent note;
+    note.type = pipeduck::DuckingEventType::Message;
+    note.message = "Configured microphone is not available";
+    reduction = pipeduck::reduce_tray_event(reduction.status, note);
+    CHECK(reduction.status.state == TrayState::Neutral);
+    CHECK(reduction.status.message == note.message);
+
+    // Partial cleanup stays visible even when the worker stops afterwards.
+    pipeduck::DuckingEvent restore_failed;
+    restore_failed.type = pipeduck::DuckingEventType::RestoreFailed;
+    restore_failed.message = "streams: #12";
+    reduction = pipeduck::reduce_tray_event(reduction.status, restore_failed);
+    CHECK(reduction.status.state == TrayState::Error);
+    CHECK(!pipeduck::tray_state_visible(reduction.status.state));
+    const auto stopped = pipeduck::reduce_worker_stopped(reduction.status);
+    CHECK(stopped.status.state == TrayState::Error);
+    CHECK(!stopped.changed);
+
+    pipeduck::TrayStatus working;
+    working.state = TrayState::Starting;
+    const auto clean_stop = pipeduck::reduce_worker_stopped(working);
+    CHECK(clean_stop.status.state == TrayState::Idle);
+    CHECK(clean_stop.status.message == "Off");
+
+    const auto fatal = pipeduck::reduce_worker_failed(working, "boom");
+    CHECK(fatal.status.state == TrayState::Error);
+    CHECK(fatal.status.message == "boom");
+    CHECK(pipeduck::tray_state_attention(fatal.status.state));
+}
+
 void test_settings() {
     g_current_test = "settings";
     pipeduck::DuckingSettings settings;
@@ -558,9 +880,15 @@ int main() {
     test_call_target();
     test_vad();
     test_routing_ports();
+    test_routing_links();
+    test_routed_stream_identity();
+    test_routed_stream_reconcile();
+    test_restore_routed_streams();
+    test_cleanup_description();
     test_pulse_json();
     test_ramp();
     test_nonblocking_ramp();
+    test_tray_state();
     test_settings();
 
     if (g_failures != 0) {

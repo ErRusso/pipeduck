@@ -29,6 +29,7 @@
 #include "pipeduck/duck.hpp"
 #include "pipeduck/icons.hpp"
 #include "pipeduck/pulse.hpp"
+#include "pipeduck/tray_state.hpp"
 #include "pipeduck_icons.hpp"
 
 namespace pipeduck {
@@ -171,7 +172,7 @@ const char* kMenuXml = R"XML(
 </node>
 )XML";
 
-enum class TrayRunState { Idle, Waiting, Starting, Neutral, Ducked, Stopping, Error };
+using TrayRunState = TrayState;
 
 struct QueuedEvent {
     uint64_t generation = 0;
@@ -210,6 +211,10 @@ struct TrayApp {
     std::optional<std::string> source_label;
     std::optional<std::string> mic_label;
     bool quitting = false;
+    // An incomplete restore leaves streams attached to an abandoned sink.
+    // Starting another session would not recover them, so keep the toggle
+    // disabled until the process is restarted.
+    bool restore_failed = false;
     uint32_t menu_revision = 1;
     uint64_t last_cache_revision = 0;
     std::optional<std::filesystem::file_time_type> last_config_mtime;
@@ -251,12 +256,11 @@ struct TrayApp {
     }
 
     bool visible_state() const {
-        return state == TrayRunState::Waiting || state == TrayRunState::Starting ||
-               state == TrayRunState::Neutral || state == TrayRunState::Ducked;
+        return tray_state_visible(state);
     }
 
     std::string state_value() const {
-        return visible_state() ? "ON" : "OFF";
+        return tray_state_value(state);
     }
 
     std::string title() const {
@@ -266,7 +270,7 @@ struct TrayApp {
     std::string status() const {
         if (quitting)
             return "Passive";
-        if (state == TrayRunState::Error)
+        if (tray_state_attention(state))
             return "NeedsAttention";
         return "Active";
     }
@@ -286,7 +290,8 @@ struct TrayApp {
     }
 
     bool can_toggle() const {
-        return !quitting && state != TrayRunState::Starting && state != TrayRunState::Stopping;
+        return !quitting && !restore_failed && state != TrayRunState::Starting &&
+               state != TrayRunState::Stopping;
     }
 
     bool tuner_enabled() const {
@@ -777,7 +782,7 @@ void TrayApp::select_source(uint32_t index) {
         select_source_impl(index);
         source_label = config_source_label();
         message = "Source saved: " + source_label.value_or("unknown");
-        if (state == TrayRunState::Error) {
+        if (state == TrayRunState::Error && !restore_failed) {
             state = TrayRunState::Idle;
         }
         notify_changed();
@@ -793,7 +798,7 @@ void TrayApp::select_mic(uint32_t index) {
         select_mic_impl(index);
         mic_label = config_mic_label();
         message = "Microphone saved: " + mic_label.value_or("default");
-        if (state == TrayRunState::Error) {
+        if (state == TrayRunState::Error && !restore_failed) {
             state = TrayRunState::Idle;
         }
         notify_changed();
@@ -847,14 +852,19 @@ void TrayApp::dispatch_events() {
             continue;
         }
         const auto& event = queued.event;
+        const auto apply = [&](const TrayReduction& reduction) {
+            state = reduction.status.state;
+            message = reduction.status.message;
+            changed = changed || reduction.changed;
+        };
+
         if (event.type == DuckingEventType::Message && event.message == "__stopped__") {
             worker_active.store(false);
             if (worker.joinable()) {
                 worker.join();
             }
-            state = TrayRunState::Idle;
-            message = "Off";
-            changed = true;
+            TrayStatus status{state, message, source_label, mic_label};
+            apply(reduce_worker_stopped(status));
             continue;
         }
         if (event.type == DuckingEventType::Message && starts_with(event.message, "__fatal__")) {
@@ -862,39 +872,14 @@ void TrayApp::dispatch_events() {
             if (worker.joinable()) {
                 worker.join();
             }
-            state = TrayRunState::Error;
-            message = event.message.substr(std::strlen("__fatal__"));
-            changed = true;
+            TrayStatus status{state, message, source_label, mic_label};
+            apply(reduce_worker_failed(status, event.message.substr(std::strlen("__fatal__"))));
             continue;
         }
-        switch (event.type) {
-        case DuckingEventType::WaitingForSource:
-            state = TrayRunState::Waiting;
-            message = event.message.empty() ? "Waiting for configured voice source" : event.message;
-            changed = true;
-            break;
-        case DuckingEventType::Started:
-            state = TrayRunState::Neutral;
-            message = "Ready: " + event.label + ", threshold=" + format_double(event.threshold, 4) +
-                      ", start=" + format_double(event.start_threshold, 4) +
-                      ", hold=" + std::to_string(event.hold_ms) + "ms";
-            changed = true;
-            break;
-        case DuckingEventType::VoiceActive:
-            state = TrayRunState::Ducked;
-            message = "Voice active: level=" + format_double(event.level, 4) + ", ducking " +
-                      std::to_string(event.duck_percent) + "%";
-            changed = true;
-            break;
-        case DuckingEventType::VoiceInactive:
-            state = TrayRunState::Neutral;
-            message = "Voice inactive: level=" + format_double(event.level, 4);
-            changed = true;
-            break;
-        case DuckingEventType::Message:
-            message = event.message;
-            changed = true;
-            break;
+        TrayStatus status{state, message, source_label, mic_label};
+        apply(reduce_tray_event(status, event));
+        if (event.type == DuckingEventType::RestoreFailed) {
+            restore_failed = true;
         }
     }
     if (changed) {
@@ -907,6 +892,7 @@ void TrayApp::start_worker() {
         return;
     }
     ++generation;
+    restore_failed = false;
     state = TrayRunState::Starting;
     message = "Starting ducking...";
     notify_changed();
@@ -941,7 +927,7 @@ void TrayApp::stop_worker() {
         worker.join();
     }
     worker_active.store(false);
-    if (quitting) {
+    if (quitting || state == TrayRunState::Error) {
         return;
     }
     state = TrayRunState::Idle;
@@ -957,12 +943,17 @@ void TrayApp::request_toggle() {
         message = "Stopping ducking...";
         notify_changed();
         stop_worker();
+        // Apply the worker's final events synchronously: an incomplete restore
+        // must remain visible instead of being overwritten with "Off".
+        dispatch_events();
         ++generation;
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
             queue.clear();
         }
-        message = "Off";
+        if (state != TrayRunState::Error) {
+            message = "Off";
+        }
         notify_changed();
     } else {
         start_worker();
