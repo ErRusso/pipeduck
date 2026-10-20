@@ -3,9 +3,13 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "pipeduck/config.hpp"
+#include "pipeduck/pipewire.hpp"
+#include "pipeduck/pulse.hpp"
 
 namespace pipeduck {
 
@@ -33,6 +37,17 @@ private:
     mutable std::mutex mutex_;
     DuckingSettings settings_;
 };
+
+struct CallTarget {
+    CaptureTarget capture;
+    std::string label;
+};
+
+// Finds the configured call stream and builds a diagnostic label for it. This
+// overload is separate from PulseCtl so the matching/label logic can be tested
+// without a live audio server.
+std::optional<CallTarget> find_call_target(const std::vector<SinkInput>& inputs,
+                                           const ConfiguredSource& source);
 
 enum class DuckingEventType {
     WaitingForSource,

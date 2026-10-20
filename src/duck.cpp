@@ -25,28 +25,8 @@ constexpr auto kSinkCheckInterval = std::chrono::milliseconds(500);
 constexpr auto kConfigReloadInterval = std::chrono::milliseconds(250);
 constexpr auto kVadAttack = std::chrono::milliseconds(40);
 
-struct CallTarget {
-    CaptureTarget capture;
-    std::string label;
-};
-
 std::optional<CallTarget> find_call_target(const PulseCtl& pulse, const ConfiguredSource& source) {
-    for (const auto& input : pulse.sink_inputs()) {
-        if (!input.identity().matches_configured_source(source)) {
-            continue;
-        }
-        const AudioIdentity identity = input.identity();
-        CaptureTarget target;
-        target.label = "#" + std::to_string(input.index) + " " + source_label(identity);
-        target.node_name = identity.node_name;
-        const auto serial = input.properties.find("object.serial");
-        if (serial != input.properties.end() && !serial->second.empty()) {
-            target.object_serial = serial->second;
-        }
-        target.sink_monitor = true;
-        return CallTarget{std::move(target), target.label};
-    }
-    return std::nullopt;
+    return find_call_target(pulse.sink_inputs(), source);
 }
 
 std::optional<CaptureTarget> find_mic_target(const Config& config) {
@@ -124,6 +104,30 @@ std::string capture_label(const std::optional<CallTarget>& call,
 enum class SessionEnd { StopRequested, SourceChanged, SinkChanged, RoutingFailed };
 
 } // namespace
+
+std::optional<CallTarget> find_call_target(const std::vector<SinkInput>& inputs,
+                                           const ConfiguredSource& source) {
+    for (const auto& input : inputs) {
+        if (!input.identity().matches_configured_source(source)) {
+            continue;
+        }
+        const AudioIdentity identity = input.identity();
+        const std::string label = "#" + std::to_string(input.index) + " " + source_label(identity);
+        CaptureTarget target;
+        target.label = label;
+        target.node_name = identity.node_name;
+        const auto serial = input.properties.find("object.serial");
+        if (serial != input.properties.end() && !serial->second.empty()) {
+            target.object_serial = serial->second;
+        }
+        target.sink_monitor = true;
+        CallTarget result;
+        result.capture = std::move(target);
+        result.label = label;
+        return result;
+    }
+    return std::nullopt;
+}
 
 DuckingSettings DuckingSettings::normalized() const {
     DuckingSettings result = *this;

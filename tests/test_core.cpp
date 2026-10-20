@@ -219,6 +219,38 @@ void test_identity() {
     CHECK(!pipeduck::looks_like_voice_text({"music", "video"}));
 }
 
+void test_call_target() {
+    g_current_test = "call-target";
+
+    pipeduck::SinkInput input;
+    input.index = 42;
+    input.properties = {
+        {"application.name", "Discord"},
+        {"application.process.binary", "discord"},
+        {"media.name", "playStream"},
+        {"media.class", "Stream/Output/Audio"},
+        {"object.serial", "99"},
+        {"node.name", "discord-call"},
+    };
+    pipeduck::ConfiguredSource source;
+    source.application_name = "Discord";
+    source.media_class = "Stream/Output/Audio";
+
+    const auto target = pipeduck::find_call_target({input}, source);
+    CHECK(target.has_value());
+    if (target.has_value()) {
+        CHECK(target->label == "#42 Discord / discord / playStream");
+        CHECK(target->capture.label == target->label);
+        CHECK(target->capture.object_serial == std::optional<std::string>("99"));
+        CHECK(target->capture.node_name == std::optional<std::string>("discord-call"));
+        CHECK(target->capture.sink_monitor);
+    }
+
+    pipeduck::ConfiguredSource missing;
+    missing.application_name = "Not Running";
+    CHECK(!pipeduck::find_call_target({input}, missing).has_value());
+}
+
 void test_vad() {
     g_current_test = "vad";
     using namespace std::chrono_literals;
@@ -417,6 +449,7 @@ int main() {
     test_config();
     test_config_file_roundtrip();
     test_identity();
+    test_call_target();
     test_vad();
     test_routing_ports();
     test_pulse_json();
