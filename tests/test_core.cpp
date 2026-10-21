@@ -540,6 +540,114 @@ void test_config_file_roundtrip() {
     unsetenv("XDG_CONFIG_HOME");
 }
 
+void test_profiles() {
+    g_current_test = "profiles";
+
+    // Legacy files without profiles behave exactly as before.
+    const pipeduck::Config legacy = pipeduck::Config::parse("duck_percent = 33\n");
+    CHECK(legacy.profiles.empty());
+    CHECK(!legacy.active_profile.has_value());
+    CHECK(legacy.duck_percent == 33);
+
+    const pipeduck::Config config = pipeduck::Config::parse(R"(
+active_profile = "meeting"
+duck_percent = 30
+vad_threshold = 0.0125
+
+[profiles.meeting]
+duck_percent = 20
+vad_threshold = 0.02
+mic_vad_threshold = 0.03
+hold_ms = 900
+attack_fade_ms = 40
+release_fade_ms = 200
+trigger = "both"
+
+[profiles.meeting.voice_source]
+label = "Zoom call"
+application_name = "Zoom"
+
+[profiles.meeting.mic_source]
+name = "alsa_input.usb-Mic"
+label = "USB Microphone"
+
+[profiles.gaming]
+duck_percent = 50
+trigger = "mic"
+)");
+    CHECK(config.profiles.size() == 2);
+    CHECK(config.active_profile == std::optional<std::string>("meeting"));
+    CHECK(config.duck_percent == 30);
+    const auto meeting = config.profiles.at("meeting");
+    CHECK(meeting.duck_percent == 20);
+    CHECK(std::abs(meeting.vad_threshold - 0.02) < 1e-9);
+    CHECK(meeting.mic_vad_threshold == std::optional<double>(0.03));
+    CHECK(meeting.hold_ms == 900);
+    CHECK(meeting.attack_fade_ms == 40);
+    CHECK(meeting.release_fade_ms == 200);
+    CHECK(meeting.trigger == pipeduck::Trigger::Both);
+    CHECK(meeting.voice_source.has_value());
+    CHECK(meeting.voice_source->application_name == std::optional<std::string>("Zoom"));
+    CHECK(meeting.mic_source.has_value());
+    CHECK(config.profiles.at("gaming").trigger == pipeduck::Trigger::Mic);
+
+    // Profiles survive a serialize/parse round trip.
+    const pipeduck::Config roundtrip = pipeduck::Config::parse(pipeduck::Config::serialize(config));
+    CHECK(roundtrip.profiles == config.profiles);
+    CHECK(roundtrip.active_profile == config.active_profile);
+    CHECK(pipeduck::Config::serialize(config).find("[profiles.meeting.voice_source]") !=
+          std::string::npos);
+
+    // Applying a profile copies its values into the top-level settings.
+    pipeduck::Config applied = config;
+    applied.apply_profile("meeting");
+    CHECK(applied.duck_percent == 20);
+    CHECK(applied.hold_ms == 900);
+    CHECK(applied.trigger == pipeduck::Trigger::Both);
+    CHECK(applied.active_profile == std::optional<std::string>("meeting"));
+    CHECK(applied.voice_source == meeting.voice_source);
+    CHECK(applied.mic_source == meeting.mic_source);
+
+    bool unknown = false;
+    try {
+        applied.apply_profile("does-not-exist");
+    } catch (const std::exception& error) {
+        unknown = true;
+        const std::string message = error.what();
+        CHECK(message.find("does-not-exist") != std::string::npos);
+        CHECK(message.find("meeting") != std::string::npos);
+    }
+    CHECK(unknown);
+
+    // Profile values use the same normalization rules as top-level settings.
+    const pipeduck::Config clamped = pipeduck::Config::parse(R"(
+[profiles.loud]
+duck_percent = 400
+vad_threshold = 99.0
+hold_ms = -5
+release_fade_ms = 99999
+)");
+    const auto loud = clamped.profiles.at("loud");
+    CHECK(loud.duck_percent == 100);
+    CHECK(std::abs(loud.vad_threshold - 0.2) < 1e-9);
+    CHECK(loud.hold_ms == 0);
+    CHECK(loud.release_fade_ms == 3000);
+
+    // Invalid names are rejected with an actionable message.
+    CHECK_THROW(pipeduck::Config::parse("[profiles.bad.name]\nduck_percent = 10\n"));
+
+    // CLI commands for profiles.
+    const auto save = parse_arguments({"pipeduck", "profile-save", "meeting"});
+    CHECK(save.command == pipeduck::Command::ProfileSave);
+    CHECK(save.profile_name == std::optional<std::string>("meeting"));
+    const auto select = parse_arguments({"pipeduck", "profile-select", "meeting"});
+    CHECK(select.command == pipeduck::Command::ProfileSelect);
+    CHECK(parse_arguments({"pipeduck", "profile-delete", "meeting"}).command ==
+          pipeduck::Command::ProfileDelete);
+    CHECK(parse_arguments({"pipeduck", "profiles"}).command == pipeduck::Command::Profiles);
+    CHECK_THROW(parse_arguments({"pipeduck", "profile-select"}));
+}
+
 void test_identity() {
     g_current_test = "identity";
     pipeduck::StringMap props{
@@ -1512,6 +1620,7 @@ int main() {
     test_common();
     test_config();
     test_config_file_roundtrip();
+    test_profiles();
     test_identity();
     test_call_target();
     test_vad();
