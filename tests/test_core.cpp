@@ -88,13 +88,19 @@ private:
 };
 
 struct FakeRoutingVolume final : pipeduck::RoutingVolume {
-    bool set_percent(const std::string&, double, bool) override {
+    bool available() const override {
+        return available_result;
+    }
+    bool set_percent(const std::string&, double, bool allow_subprocess_fallback) override {
         ++calls;
+        last_allow_subprocess_fallback = allow_subprocess_fallback;
         return result;
     }
 
     int calls = 0;
     bool result = true;
+    bool available_result = true;
+    bool last_allow_subprocess_fallback = true;
 };
 
 struct FakeRoutingBackend final : pipeduck::RoutingBackend {
@@ -120,6 +126,9 @@ struct FakeRoutingBackend final : pipeduck::RoutingBackend {
         return real_sink_name;
     }
     std::optional<pipeduck::Sink> sink_by_name(const std::string& name) override {
+        if (fail_sink_by_name) {
+            throw std::runtime_error("simulated backend unavailable");
+        }
         if (name == real_sink_name) {
             return pipeduck::Sink{real_sink_index, real_sink_name, "Real output"};
         }
@@ -254,6 +263,7 @@ struct FakeRoutingBackend final : pipeduck::RoutingBackend {
     bool sink_destroyed = false;
     bool sink_abandoned = false;
     bool fail_sink_inputs = false;
+    bool fail_sink_by_name = false;
     int fail_list_links_calls = 0;
     std::string fail_create_input;
     int fail_create_input_calls = 0;
@@ -283,6 +293,8 @@ pipeduck::RoutingOptions fast_routing_options() {
     options.port_appear_timeout = std::chrono::milliseconds(0);
     options.restore_timeout = std::chrono::milliseconds(0);
     options.retry_interval = std::chrono::milliseconds(1);
+    options.volume_retry_initial = std::chrono::milliseconds(5);
+    options.volume_retry_max = std::chrono::milliseconds(10);
     return options;
 }
 
@@ -919,6 +931,105 @@ void test_routing_backend_sink_disappearance() {
     CHECK(!backend->sink_abandoned);
 }
 
+void test_routing_control_tick_no_fallback() {
+    g_current_test = "routing-control-tick";
+    auto backend = std::make_shared<FakeRoutingBackend>();
+    pipeduck::RoutingEngine engine(std::nullopt, std::nullopt, backend);
+    auto session = engine.start(fast_routing_options());
+    CHECK(backend->last_volume != nullptr);
+
+    // The 25 ms tick path must never permit the blocking `pactl` fallback.
+    CHECK(session.start_ramp(25.0, 1000));
+    for (int tick = 0; tick < 10; ++tick) {
+        (void)session.tick_ramp();
+    }
+    CHECK(backend->last_volume->calls > 0);
+    CHECK(!backend->last_volume->last_allow_subprocess_fallback);
+
+    // An immediate (zero-duration) fade also stays subprocess-free.
+    CHECK(session.start_ramp(100.0, 0));
+    CHECK(!backend->last_volume->last_allow_subprocess_fallback);
+
+    const auto cleanup = session.stop();
+    CHECK(cleanup.complete);
+}
+
+void test_routing_volume_backoff() {
+    g_current_test = "routing-volume-backoff";
+    using namespace std::chrono_literals;
+    auto backend = std::make_shared<FakeRoutingBackend>();
+    pipeduck::RoutingEngine engine(std::nullopt, std::nullopt, backend);
+    auto session = engine.start(fast_routing_options());
+    FakeRoutingVolume* volume = backend->last_volume;
+    CHECK(volume != nullptr);
+
+    volume->result = false;
+    // The initial immediate update fails and schedules the first retry.
+    const int calls_before = volume->calls;
+    CHECK(!session.start_ramp(25.0, 0));
+    const int calls_after_failure = volume->calls;
+    CHECK(calls_after_failure == calls_before + 1);
+
+    // Ticks inside the backoff window must not call the backend again.
+    for (int tick = 0; tick < 50; ++tick) {
+        (void)session.tick_ramp();
+    }
+    CHECK(volume->calls == calls_after_failure);
+
+    // Once the window elapses, the pending value is retried.
+    std::this_thread::sleep_for(8ms);
+    (void)session.tick_ramp();
+    CHECK(volume->calls > calls_after_failure);
+
+    // A recovered backend applies the pending value and clears the failure.
+    volume->result = true;
+    std::this_thread::sleep_for(15ms);
+    CHECK(session.tick_ramp());
+    CHECK(std::abs(session.volume_percent() - 25.0) < 1e-9);
+
+    const auto cleanup = session.stop();
+    CHECK(cleanup.complete);
+}
+
+void test_routing_volume_reconnects() {
+    g_current_test = "routing-volume-reconnect";
+    auto backend = std::make_shared<FakeRoutingBackend>();
+    pipeduck::RoutingEngine engine(std::nullopt, std::nullopt, backend);
+    auto session = engine.start(fast_routing_options());
+    CHECK(backend->create_volume_calls == 1);
+
+    // The current volume backend reports itself gone. The next update must
+    // recreate it instead of reusing a dead context.
+    backend->last_volume->available_result = false;
+    CHECK(session.start_ramp(25.0, 0));
+    CHECK(backend->create_volume_calls == 2);
+    CHECK(std::abs(session.volume_percent() - 25.0) < 1e-9);
+
+    const auto cleanup = session.stop();
+    CHECK(cleanup.complete);
+}
+
+void test_routing_graph_health() {
+    g_current_test = "routing-graph-health";
+    auto backend = std::make_shared<FakeRoutingBackend>();
+    pipeduck::RoutingEngine engine(std::nullopt, std::nullopt, backend);
+    auto session = engine.start(fast_routing_options());
+    CHECK(session.check_graph() == pipeduck::GraphHealth::Healthy);
+
+    // The virtual sink disappeared: the control loop must be able to detect it
+    // without touching a live audio server or spawning a process.
+    backend->sink_present = false;
+    CHECK(session.check_graph() == pipeduck::GraphHealth::SinkMissing);
+
+    backend->sink_present = true;
+    backend->fail_sink_by_name = true;
+    CHECK(session.check_graph() == pipeduck::GraphHealth::BackendUnavailable);
+
+    backend->fail_sink_by_name = false;
+    const auto cleanup = session.stop();
+    CHECK(cleanup.complete);
+}
+
 void test_routing_backend_factory() {
     g_current_test = "routing-backend-factory";
     auto backend = pipeduck::make_pulse_routing_backend();
@@ -1300,6 +1411,16 @@ void test_tray_state() {
     reduction = pipeduck::reduce_tray_event(reduction.status, recovering);
     CHECK(reduction.status.state == TrayState::Recovering);
 
+    // Repeated rebuild failures keep the tray out of the ON state and ask for
+    // attention instead of silently reporting recovery.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        reduction = pipeduck::reduce_tray_event(reduction.status, failure);
+        CHECK(reduction.status.state == TrayState::Recovering);
+        CHECK(!pipeduck::tray_state_visible(reduction.status.state));
+        CHECK(pipeduck::tray_state_attention(reduction.status.state));
+        CHECK(pipeduck::tray_state_value(reduction.status.state) == "OFF");
+    }
+
     pipeduck::DuckingEvent started;
     started.type = pipeduck::DuckingEventType::Started;
     started.label = "#7 Discord / discord / playStream";
@@ -1402,6 +1523,10 @@ int main() {
     test_routing_backend_restore_failure();
     test_routing_backend_stream_changes();
     test_routing_backend_sink_disappearance();
+    test_routing_control_tick_no_fallback();
+    test_routing_volume_backoff();
+    test_routing_volume_reconnects();
+    test_routing_graph_health();
     test_routing_backend_factory();
     test_routed_stream_identity();
     test_routed_stream_reconcile();

@@ -676,6 +676,12 @@ bool PulseCache::set_source_volume_percent(const std::string& source_name, doubl
     return ok;
 }
 
+void PulseCtl::require_fallback() const {
+    if (!allow_fallback_) {
+        throw std::runtime_error("PulseAudio backend is unavailable");
+    }
+}
+
 std::string PulseCtl::default_sink_name() const {
     PulseCache& cache = PulseCache::shared();
     if (cache.available()) {
@@ -687,6 +693,7 @@ std::string PulseCtl::default_sink_name() const {
         } catch (const std::exception&) {
         }
     }
+    require_fallback();
     return trim(run_command_checked("pactl", {"get-default-sink"}, kTimeout));
 }
 
@@ -701,6 +708,7 @@ std::string PulseCtl::default_source_name() const {
         } catch (const std::exception&) {
         }
     }
+    require_fallback();
     return trim(run_command_checked("pactl", {"get-default-source"}, kTimeout));
 }
 
@@ -709,6 +717,7 @@ void PulseCtl::set_default_sink(const std::string& sink_name) const {
     if (cache.available() && cache.set_default_sink(sink_name)) {
         return;
     }
+    require_fallback();
     run_status_checked("pactl", {"set-default-sink", sink_name}, kTimeout);
 }
 
@@ -720,6 +729,7 @@ std::vector<Sink> PulseCtl::sinks() const {
         } catch (const std::exception&) {
         }
     }
+    require_fallback();
     return parse_sinks_json(
         run_command_checked("pactl", {"--format=json", "list", "sinks"}, kTimeout));
 }
@@ -763,6 +773,7 @@ std::vector<SinkInput> PulseCtl::sink_inputs() const {
         } catch (const std::exception&) {
         }
     }
+    require_fallback();
     return parse_sink_inputs_json(
         run_command_checked("pactl", {"--format=json", "list", "sink-inputs"}, kTimeout));
 }
@@ -785,6 +796,7 @@ std::vector<Source> PulseCtl::sources() const {
         } catch (const std::exception&) {
         }
     }
+    require_fallback();
     return parse_sources_json(
         run_command_checked("pactl", {"--format=json", "list", "sources"}, kTimeout));
 }
@@ -812,6 +824,7 @@ void PulseCtl::move_sink_input(uint32_t input_index, const std::string& sink_nam
     if (cache.available() && cache.move_sink_input(input_index, sink_name)) {
         return;
     }
+    require_fallback();
     run_status_checked("pactl", {"move-sink-input", std::to_string(input_index), sink_name},
                        kTimeout);
 }
@@ -821,6 +834,7 @@ void PulseCtl::move_sink_input_to_index(uint32_t input_index, uint32_t sink_inde
     if (cache.available() && cache.move_sink_input_to_index(input_index, sink_index)) {
         return;
     }
+    require_fallback();
     run_status_checked("pactl",
                        {"move-sink-input", std::to_string(input_index), std::to_string(sink_index)},
                        kTimeout);
@@ -834,6 +848,7 @@ void PulseCtl::set_source_volume_percent(const std::string& source_name, double 
     const double clamped = std::clamp(percent, 0.0, 150.0);
     // PulseAudio's raw volume scale: 65536 == 100%.
     const int raw = static_cast<int>(std::lround(clamped / 100.0 * 65536.0));
+    require_fallback();
     run_status_checked("pactl", {"set-source-volume", source_name, std::to_string(raw)}, kTimeout);
 }
 

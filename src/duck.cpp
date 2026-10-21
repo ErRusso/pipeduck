@@ -40,8 +40,7 @@ std::optional<CallTarget> find_call_target(const PulseCtl& pulse, const Configur
     return find_call_target(pulse.sink_inputs(), source);
 }
 
-std::optional<CaptureTarget> find_mic_target(const Config& config) {
-    const PulseCtl pulse;
+std::optional<CaptureTarget> find_mic_target(const PulseCtl& pulse, const Config& config) {
     const auto sources = pulse.sources();
     std::vector<Source> candidates;
     for (const auto& source : sources) {
@@ -241,7 +240,7 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
 
         if (config.voice_source.has_value()) {
             try {
-                auto maybe_call = find_call_target(PulseCtl{}, *config.voice_source);
+                auto maybe_call = find_call_target(PulseCtl{false}, *config.voice_source);
                 if (maybe_call.has_value()) {
                     // The configured call stream is excluded from ducking even in
                     // microphone-only mode, and its sink becomes the routing target.
@@ -262,10 +261,10 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
         std::string mic_note;
         if (wants_mic) {
             try {
-                mic = find_mic_target(config);
+                mic = find_mic_target(PulseCtl{false}, config);
                 if (config.mic_source.has_value() && config.mic_source->name.has_value() &&
                     mic.has_value()) {
-                    const auto sources = PulseCtl{}.sources();
+                    const auto sources = PulseCtl{false}.sources();
                     bool configured_found = false;
                     for (const auto& source : sources) {
                         if (!source.is_monitor && source.name == *config.mic_source->name) {
@@ -303,7 +302,10 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
 
         std::optional<RouteSession> session;
         try {
-            RoutingEngine engine(exclusion, config.mic_source);
+            // The worker must never block on a `pactl` fallback. If the
+            // event-driven backend is unavailable, start() fails fast and the
+            // outer loop retries with backoff.
+            RoutingEngine engine(exclusion, config.mic_source, make_pulse_routing_backend(false));
             session.emplace(engine.start());
             routing_backoff = kInitialRoutingBackoff;
         } catch (const std::exception& error) {
@@ -404,7 +406,7 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
                 if (call.has_value()) {
                     const auto current_call =
                         config.voice_source.has_value()
-                            ? find_call_target(PulseCtl{}, *config.voice_source)
+                            ? find_call_target(PulseCtl{false}, *config.voice_source)
                             : std::nullopt;
                     if (!current_call.has_value() ||
                         !same_stream(current_call->capture, call->capture)) {
@@ -413,7 +415,8 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
                     }
                 } else if (trigger == Trigger::Both && config.voice_source.has_value()) {
                     // A call may start after mic ducking is already running.
-                    const auto current_call = find_call_target(PulseCtl{}, *config.voice_source);
+                    const auto current_call =
+                        find_call_target(PulseCtl{false}, *config.voice_source);
                     if (current_call.has_value()) {
                         end = SessionEnd::SourceChanged;
                         break;
@@ -436,15 +439,14 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
 
             if (now >= next_sink_check) {
                 try {
-                    const PulseCtl pulse;
+                    const PulseCtl pulse(false);
                     const std::string default_sink = pulse.default_sink_name();
                     if (!default_sink.empty() && default_sink != session->real_sink_name() &&
                         default_sink != session->virtual_sink_name()) {
                         end = SessionEnd::SinkChanged;
                         break;
                     }
-                    if (!pulse.sink_by_name(session->real_sink_name()).has_value() ||
-                        !pulse.sink_by_name(session->virtual_sink_name()).has_value()) {
+                    if (session->check_graph() != GraphHealth::Healthy) {
                         end = SessionEnd::RoutingFailed;
                         break;
                     }
