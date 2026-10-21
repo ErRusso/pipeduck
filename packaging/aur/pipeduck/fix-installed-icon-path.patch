@@ -1,0 +1,28 @@
+From: ErRusso <172048352+ErRusso@users.noreply.github.com>
+Subject: [PATCH] cmake: make the fallback asset directory configurable
+
+Packagers install icons under the system icon theme, so embedding the build
+directory as PIPEDUCK_ASSETS_DIR leaves an unnecessary reference to the
+package build root in the binary. Allow the path to be overridden while
+keeping the source-tree default for uninstalled development builds.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -13,6 +13,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ option(PIPEDUCK_BUILD_TESTS "Build the unit tests" ON)
+ option(PIPEDUCK_GUI "Build the GTK4 graphical tuner" ON)
++set(PIPEDUCK_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons" CACHE PATH
++    "Fallback icon directory for uninstalled builds")
+ 
+ find_package(PkgConfig REQUIRED)
+ pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
+@@ -67,7 +69,7 @@ target_include_directories(pipeduck_core
+ target_link_libraries(pipeduck_core
+     PUBLIC PkgConfig::PIPEWIRE PkgConfig::PULSE PkgConfig::JSONC)
+ target_compile_definitions(pipeduck_core
+-    PRIVATE PIPEDUCK_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/icons")
++    PRIVATE PIPEDUCK_ASSETS_DIR="${PIPEDUCK_ASSETS_DIR}")
+ target_compile_options(pipeduck_core PRIVATE -Wall -Wextra -Wpedantic)
+ 
+ add_executable(pipeduck

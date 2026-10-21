@@ -1,0 +1,51 @@
+# Maintainer: ErRusso <172048352+ErRusso@users.noreply.github.com>
+
+pkgname=pipeduck-git
+pkgver=1.1.0.r9.g817d137
+pkgrel=1
+pkgdesc='Automatic audio ducking for PipeWire, controlled from the system tray (development version)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/ErRusso/pipeduck'
+license=('MIT')
+depends=(
+  'pipewire'
+  'libpulse'
+  'json-c'
+  'glib2'
+  'gtk4'
+  'ncurses'
+)
+makedepends=('cmake' 'pkgconf' 'git')
+checkdepends=('dbus')
+optdepends=(
+  'pipewire-pulse: PulseAudio compatibility layer used by pactl'
+  'gnome-shell-extension-appindicator: StatusNotifierItem tray support on GNOME'
+)
+provides=('pipeduck')
+conflicts=('pipeduck')
+source=("${pkgname%-git}::git+https://github.com/ErRusso/pipeduck.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "${pkgname%-git}"
+  git describe --long --tags --abbrev=7 --match 'v*' | sed 's/^v//; s/\([^-]*-g\)/r\1/; s/-/./g'
+}
+
+build() {
+  cmake -S "${pkgname%-git}" -B build \
+    -DCMAKE_BUILD_TYPE=None \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DPIPEDUCK_BUILD_TESTS=ON \
+    -DPIPEDUCK_GUI=ON \
+    -DPIPEDUCK_ASSETS_DIR=/usr/share/icons
+  cmake --build build --parallel
+}
+
+check() {
+  ctest --test-dir build --output-on-failure
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 "${pkgname%-git}/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

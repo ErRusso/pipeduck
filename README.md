@@ -61,6 +61,15 @@ The GTK4 package is optional; build with `-DPIPEDUCK_GUI=OFF` to omit the graphi
 
 ## Install
 
+### Arch Linux (AUR)
+
+```bash
+yay -S pipeduck          # latest release
+yay -S pipeduck-git      # development snapshot from main
+```
+
+The AUR recipes are optional and maintained in [`packaging/aur`](packaging/aur).
+
 ### From source
 
 ```bash

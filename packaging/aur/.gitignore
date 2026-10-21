@@ -1,0 +1,5 @@
+# makepkg working directories and artifacts
+pkg/
+src/
+*.pkg.tar.*
+*.tar.gz
