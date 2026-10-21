@@ -4,6 +4,16 @@ All notable changes to PipeDuck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- The ducking control tick never spawns a `pactl` fallback or blocks on an unavailable audio
+  backend. Monitor-volume updates use a bounded exponential backoff and recreate the libpulse
+  context when the backend returns.
+- The control loop detects a missing virtual sink or output within the refresh interval, shows a
+  recovering/degraded state instead of `ON`, and rebuilds the route with backoff.
+
 ## [1.1.0] - 2026-10-19
 
 ### Added

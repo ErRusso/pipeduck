@@ -83,6 +83,12 @@ private:
 
 class PulseCtl {
 public:
+    // When `allow_subprocess_fallback` is false, graph queries never spawn
+    // `pactl`; they fail fast when the libpulse event cache is unavailable.
+    // Use the non-blocking mode from the real-time ducking control loop.
+    explicit PulseCtl(bool allow_subprocess_fallback = true)
+        : allow_fallback_(allow_subprocess_fallback) {}
+
     std::string default_sink_name() const;
     std::string default_source_name() const;
     void set_default_sink(const std::string& sink_name) const;
@@ -107,6 +113,9 @@ public:
     static uint64_t cache_revision();
 
 private:
+    void require_fallback() const;
+
+    bool allow_fallback_ = true;
     static constexpr std::chrono::milliseconds kTimeout{5000};
 };
 

@@ -93,6 +93,9 @@ private:
 
 class PulseRoutingVolume final : public RoutingVolume {
 public:
+    bool available() const override {
+        return volume_.native();
+    }
     bool set_percent(const std::string& source_name, double percent,
                      bool allow_subprocess_fallback) override {
         return volume_.set_percent(source_name, percent, allow_subprocess_fallback);
@@ -104,6 +107,9 @@ private:
 
 class PulseRoutingBackend final : public RoutingBackend {
 public:
+    explicit PulseRoutingBackend(bool allow_subprocess_fallback)
+        : pulse_(allow_subprocess_fallback) {}
+
     std::string default_sink_name() override {
         return pulse_.default_sink_name();
     }
@@ -168,8 +174,8 @@ private:
 
 } // namespace
 
-std::shared_ptr<RoutingBackend> make_pulse_routing_backend() {
-    return std::make_shared<PulseRoutingBackend>();
+std::shared_ptr<RoutingBackend> make_pulse_routing_backend(bool allow_subprocess_fallback) {
+    return std::make_shared<PulseRoutingBackend>(allow_subprocess_fallback);
 }
 
 std::vector<PortLink> monitor_links_for_ports(const std::string& outputs, const std::string& inputs,
@@ -388,6 +394,13 @@ struct RouteSession::Impl {
     VolumeRamp ramp;
     std::chrono::milliseconds restore_timeout{3000};
     std::chrono::milliseconds retry_interval{50};
+    std::chrono::milliseconds volume_retry_initial{500};
+    std::chrono::milliseconds volume_retry_max{4000};
+    // Bounded retry state for monitor-volume updates. The control tick must not
+    // hammer libpulse or spawn a subprocess when the backend is lost.
+    std::chrono::steady_clock::time_point volume_retry_at{};
+    bool volume_retry_scheduled = false;
+    int volume_failures = 0;
     // The last fade value the backend rejected. Retried from tick_ramp() so a
     // transient backend loss does not silently leave the wrong volume applied.
     bool pending_volume = false;
@@ -424,10 +437,37 @@ bool RouteSession::set_percent(double percent, bool allow_subprocess_fallback) {
     if (impl_ == nullptr || impl_->stopped || impl_->volume == nullptr) {
         return false;
     }
-    if (!impl_->volume->set_percent(impl_->monitor_source_name(), percent,
-                                    allow_subprocess_fallback)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!allow_subprocess_fallback && impl_->volume_retry_scheduled &&
+        now < impl_->volume_retry_at) {
+        // Still in the bounded backoff window: skip without touching the
+        // backend. The caller sees a failure and reports a degraded session.
         return false;
     }
+    if (!allow_subprocess_fallback && !impl_->volume->available() && impl_->backend != nullptr) {
+        // Recreate the volume context at the retry boundary so a backend that
+        // came back is picked up without restarting the whole session.
+        impl_->volume = impl_->backend->create_volume();
+        if (impl_->volume == nullptr) {
+            return false;
+        }
+    }
+    if (!impl_->volume->set_percent(impl_->monitor_source_name(), percent,
+                                    allow_subprocess_fallback)) {
+        if (!allow_subprocess_fallback) {
+            ++impl_->volume_failures;
+            const int doublings = std::min(impl_->volume_failures - 1, 8);
+            auto delay = impl_->volume_retry_initial * (1 << doublings);
+            if (delay > impl_->volume_retry_max) {
+                delay = impl_->volume_retry_max;
+            }
+            impl_->volume_retry_at = now + delay;
+            impl_->volume_retry_scheduled = true;
+        }
+        return false;
+    }
+    impl_->volume_failures = 0;
+    impl_->volume_retry_scheduled = false;
     volume_percent_ = percent;
     impl_->pending_volume = false;
     return true;
@@ -569,6 +609,24 @@ bool RouteSession::ensure_monitor_links() {
         std::cerr << "pipeduck: could not verify monitor links: " << error.what() << "\n";
         return false;
     }
+}
+
+GraphHealth RouteSession::check_graph() {
+    if (impl_ == nullptr || impl_->stopped || impl_->backend == nullptr) {
+        return GraphHealth::BackendUnavailable;
+    }
+    try {
+        // Check both the real output and the virtual sink by their stable
+        // names. This is cheap (event-driven cache) and never spawns a process
+        // when the backend was created in non-blocking mode.
+        if (!impl_->backend->sink_by_name(impl_->real_sink_name).has_value() ||
+            !impl_->backend->sink_by_name(impl_->virtual_sink_name).has_value()) {
+            return GraphHealth::SinkMissing;
+        }
+    } catch (const std::exception&) {
+        return GraphHealth::BackendUnavailable;
+    }
+    return GraphHealth::Healthy;
 }
 
 RouteCleanupResult RouteSession::stop() {
@@ -761,6 +819,8 @@ RouteSession RoutingEngine::start(const RoutingOptions& options) {
     impl.backend = backend;
     impl.restore_timeout = options.restore_timeout;
     impl.retry_interval = options.retry_interval;
+    impl.volume_retry_initial = options.volume_retry_initial;
+    impl.volume_retry_max = options.volume_retry_max;
     impl.real_sink_name = real_sink->name;
     impl.real_sink_index = real_sink->index;
     impl.volume = backend->create_volume();

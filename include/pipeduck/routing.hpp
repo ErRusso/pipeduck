@@ -20,6 +20,9 @@ struct RoutingOptions {
     std::chrono::milliseconds port_appear_timeout{2000};
     std::chrono::milliseconds restore_timeout{3000};
     std::chrono::milliseconds retry_interval{50};
+    // Bounded backoff for monitor-volume updates when the backend is lost.
+    std::chrono::milliseconds volume_retry_initial{500};
+    std::chrono::milliseconds volume_retry_max{4000};
 };
 
 struct PortLink {
@@ -113,6 +116,9 @@ public:
 class RoutingVolume {
 public:
     virtual ~RoutingVolume() = default;
+    // False when the underlying backend is gone. The session recreates the
+    // volume backend at the next bounded retry instead of retrying every tick.
+    virtual bool available() const = 0;
     virtual bool set_percent(const std::string& source_name, double percent,
                              bool allow_subprocess_fallback) = 0;
 };
@@ -140,9 +146,15 @@ public:
     virtual void remove_link(const PortLink& link) = 0;
 };
 
-std::shared_ptr<RoutingBackend> make_pulse_routing_backend();
+std::shared_ptr<RoutingBackend> make_pulse_routing_backend(bool allow_subprocess_fallback = true);
 
 class RoutingEngine;
+
+enum class GraphHealth {
+    Healthy,
+    SinkMissing,
+    BackendUnavailable,
+};
 
 class RouteSession {
 public:
@@ -171,6 +183,10 @@ public:
     // Re-create monitor links that disappeared while routing. Returns false when
     // the graph cannot be repaired (for example, the virtual sink vanished).
     bool ensure_monitor_links();
+
+    // Cheap health check for the control loop. Uses the routing backend only,
+    // so it never spawns a subprocess.
+    GraphHealth check_graph();
 
     // Restore every moved stream and tear the virtual sink down. Safe to call
     // multiple times. If a stream cannot be moved away, the sink is left alive
