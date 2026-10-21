@@ -29,9 +29,7 @@ public:
     }
     void destroy();
     // Leave the server-side node alive to avoid terminating playback streams.
-    void abandon() {
-        abandoned_ = true;
-    }
+    void abandon();
 
 private:
     VirtualSink();

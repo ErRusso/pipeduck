@@ -210,7 +210,7 @@ std::unique_ptr<VirtualSink> VirtualSink::create(const std::string& prefix) {
 }
 
 void VirtualSink::destroy() {
-    if (impl_ == nullptr || impl_->object == nullptr || destroyed_) {
+    if (impl_ == nullptr || impl_->object == nullptr || destroyed_ || abandoned_) {
         return;
     }
     pw_thread_loop_lock(impl_->runtime->loop());
@@ -219,6 +219,13 @@ void VirtualSink::destroy() {
     impl_->runtime->sync_locked();
     pw_thread_loop_unlock(impl_->runtime->loop());
     destroyed_ = true;
+}
+
+void VirtualSink::abandon() {
+    abandoned_ = true;
+    if (impl_ != nullptr) {
+        impl_->abandoned = true;
+    }
 }
 
 struct VoiceActivityMonitor::Impl {
