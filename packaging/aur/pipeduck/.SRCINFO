@@ -1,0 +1,25 @@
+pkgbase = pipeduck
+	pkgdesc = Automatic audio ducking for PipeWire, controlled from the system tray
+	pkgver = 1.1.0
+	pkgrel = 1
+	url = https://github.com/ErRusso/pipeduck
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	checkdepends = dbus
+	makedepends = cmake
+	makedepends = pkgconf
+	depends = pipewire
+	depends = libpulse
+	depends = json-c
+	depends = glib2
+	depends = gtk4
+	depends = ncurses
+	optdepends = pipewire-pulse: PulseAudio compatibility layer used by pactl
+	optdepends = gnome-shell-extension-appindicator: StatusNotifierItem tray support on GNOME
+	source = pipeduck-1.1.0.tar.gz::https://github.com/ErRusso/pipeduck/archive/refs/tags/v1.1.0.tar.gz
+	source = fix-installed-icon-path.patch
+	sha256sums = 6f013a205563d425e4e6af337417d8a3d4af9adea5917b7252df9763b912ef86
+	sha256sums = 1d71c48185b2ed10b80e32456cd23272e41209c7f9de98147e63e5c3cfd5c524
+
+pkgname = pipeduck
