@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <optional>
 #include <string>
 
@@ -31,6 +32,28 @@ struct ConfiguredMic {
     bool operator==(const ConfiguredMic&) const = default;
 };
 
+// A named preset bundling the ducking settings and routing selection. Profiles
+// are stored in the config file; applying one copies its values into the
+// top-level keys so the existing SettingsStore/config-reload path remains the
+// only source of truth.
+struct Config;
+
+struct DuckingProfile {
+    int duck_percent = 25;
+    double vad_threshold = 0.01;
+    std::optional<double> mic_vad_threshold;
+    int hold_ms = 700;
+    int attack_fade_ms = 80;
+    int release_fade_ms = 320;
+    Trigger trigger = Trigger::Call;
+    std::optional<ConfiguredSource> voice_source;
+    std::optional<ConfiguredMic> mic_source;
+
+    static DuckingProfile from_config(const Config& config);
+    DuckingProfile normalized() const;
+    bool operator==(const DuckingProfile&) const = default;
+};
+
 struct Config {
     int duck_percent = 25;
     double vad_threshold = 0.01;
@@ -43,8 +66,15 @@ struct Config {
     Trigger trigger = Trigger::Call;
     std::optional<ConfiguredSource> voice_source;
     std::optional<ConfiguredMic> mic_source;
+    // Name of the last profile copied into the top-level settings, if any.
+    std::optional<std::string> active_profile;
+    std::map<std::string, DuckingProfile> profiles;
 
     Config normalized() const;
+
+    // Replace the top-level settings with the named profile. Throws with an
+    // actionable message when the profile does not exist.
+    void apply_profile(const std::string& name);
 
     static Config defaults();
     static Config load_or_default();

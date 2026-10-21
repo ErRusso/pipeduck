@@ -56,12 +56,15 @@ enum MenuId {
     kIdMicMenu = 40,
     kIdTuner = 50,
     kIdQuit = 60,
+    kIdProfileMenu = 70,
+    kIdProfileError = 999997,
     kIdMicError = 999998,
     kIdSourceError = 999999,
     kIdSourceBase = 1000000,
     kIdMicBase = 2000000,
     kIdSourceGroupBase = 3000000,
     kIdMicGroupBase = 4000000,
+    kIdProfileBase = 5000000,
 };
 
 const char* kSniXml = R"XML(
@@ -294,6 +297,14 @@ struct TrayApp {
                state != TrayRunState::Stopping;
     }
 
+    // Routing identity (trigger, source, microphone, profile) is read-only
+    // while a worker is running. A failed selection that leaves state == Error
+    // must not unlock editing while the worker is still active.
+    bool editing_locked() const {
+        return quitting || worker_active.load() || state == TrayRunState::Starting ||
+               state == TrayRunState::Stopping;
+    }
+
     bool tuner_enabled() const {
 #ifdef PIPEDUCK_GUI
         return true;
@@ -321,6 +332,7 @@ struct TrayApp {
     void open_tuner();
     void select_source(uint32_t index);
     void select_mic(uint32_t index);
+    void select_profile(int ordinal);
     void set_trigger(Trigger trigger);
     void register_with_watcher();
 };
@@ -407,13 +419,13 @@ GVariant* make_children(const std::vector<GVariant*>& items) {
     return g_variant_builder_end(&builder);
 }
 
-std::vector<GVariant*> trigger_children(const Config& config) {
+std::vector<GVariant*> trigger_children(const Config& config, bool enabled) {
     std::vector<GVariant*> items;
-    items.push_back(make_item(kIdTriggerCall, "Call audio (remote voice)", true,
+    items.push_back(make_item(kIdTriggerCall, "Call audio (remote voice)", enabled,
                               config.trigger == Trigger::Call));
     items.push_back(
-        make_item(kIdTriggerMic, "My microphone", true, config.trigger == Trigger::Mic));
-    items.push_back(make_item(kIdTriggerBoth, "Call audio or microphone", true,
+        make_item(kIdTriggerMic, "My microphone", enabled, config.trigger == Trigger::Mic));
+    items.push_back(make_item(kIdTriggerBoth, "Call audio or microphone", enabled,
                               config.trigger == Trigger::Both));
     return items;
 }
@@ -455,7 +467,7 @@ std::string microphone_group_key(const Source& source) {
     return source.description.empty() ? source.name : source.description;
 }
 
-std::vector<GVariant*> source_children() {
+std::vector<GVariant*> source_children(bool enabled) {
     std::vector<GVariant*> items;
     try {
         const PulseCtl pulse;
@@ -484,7 +496,7 @@ std::vector<GVariant*> source_children() {
             if (streams.size() == 1) {
                 const auto* input = streams.front();
                 items.push_back(make_item(static_cast<int>(kIdSourceBase + input->index),
-                                          stream_label(*input)));
+                                          stream_label(*input), enabled));
                 continue;
             }
 
@@ -492,12 +504,12 @@ std::vector<GVariant*> source_children() {
             children.reserve(streams.size());
             for (const auto* input : streams) {
                 children.push_back(make_item(static_cast<int>(kIdSourceBase + input->index),
-                                             stream_label(*input)));
+                                             stream_label(*input), enabled));
             }
             const std::string label =
                 application + " (" + std::to_string(streams.size()) + " streams)";
             items.push_back(make_item(static_cast<int>(kIdSourceGroupBase + group_ordinal), label,
-                                      true, std::nullopt, make_children(children)));
+                                      enabled, std::nullopt, make_children(children)));
             ++group_ordinal;
         }
     } catch (const std::exception& error) {
@@ -510,7 +522,7 @@ std::vector<GVariant*> source_children() {
     return items;
 }
 
-std::vector<GVariant*> mic_children(const Config& config) {
+std::vector<GVariant*> mic_children(const Config& config, bool enabled) {
     std::vector<GVariant*> items;
     std::string default_source;
     try {
@@ -553,8 +565,8 @@ std::vector<GVariant*> mic_children(const Config& config) {
                 if (!source.description.empty()) {
                     label += " - " + source.description;
                 }
-                items.push_back(make_item(static_cast<int>(kIdMicBase + source.index), label, true,
-                                          selected(source)));
+                items.push_back(make_item(static_cast<int>(kIdMicBase + source.index), label,
+                                          enabled, selected(source)));
                 continue;
             }
 
@@ -566,12 +578,12 @@ std::vector<GVariant*> mic_children(const Config& config) {
                     label += " (default)";
                 }
                 children.push_back(make_item(static_cast<int>(kIdMicBase + source->index), label,
-                                             true, selected(*source)));
+                                             enabled, selected(*source)));
             }
             const std::string label =
                 device + " (" + std::to_string(device_sources.size()) + " inputs)";
             items.push_back(make_item(static_cast<int>(kIdMicGroupBase + group_ordinal), label,
-                                      true, std::nullopt, make_children(children)));
+                                      enabled, std::nullopt, make_children(children)));
             ++group_ordinal;
         }
     } catch (const std::exception& error) {
@@ -580,6 +592,25 @@ std::vector<GVariant*> mic_children(const Config& config) {
     }
     if (items.empty()) {
         items.push_back(make_item(kIdMicError, "No microphones visible", false));
+    }
+    return items;
+}
+
+std::vector<GVariant*> profile_children(const Config& config, bool enabled) {
+    std::vector<GVariant*> items;
+    int ordinal = 0;
+    for (const auto& [name, profile] : config.profiles) {
+        const bool active = config.active_profile.has_value() && *config.active_profile == name;
+        const std::string label = name + " - duck " + std::to_string(profile.duck_percent) + "%, " +
+                                  trigger_name(profile.trigger) + ", hold " +
+                                  std::to_string(profile.hold_ms) + "ms";
+        items.push_back(
+            make_item(static_cast<int>(kIdProfileBase + ordinal), label, enabled, active));
+        ++ordinal;
+    }
+    if (items.empty()) {
+        items.push_back(make_item(
+            kIdProfileError, "No profiles configured (use pipeduck profile-save NAME)", false));
     }
     return items;
 }
@@ -609,12 +640,19 @@ GVariant* build_root_layout(TrayApp& app) {
                                   std::to_string(settings.release_fade_ms) + "ms",
                               false));
     items.push_back(make_item(kIdToggle, "Ducking", app.can_toggle(), app.visible_state()));
-    items.push_back(make_item(kIdTriggerMenu, "Trigger: " + trigger_name(config.trigger), true,
-                              std::nullopt, make_children(trigger_children(config))));
-    items.push_back(make_item(kIdSourceMenu, "Source: choose", true, std::nullopt,
-                              make_children(source_children())));
-    items.push_back(make_item(kIdMicMenu, "Microphone: choose", true, std::nullopt,
-                              make_children(mic_children(config))));
+
+    const bool editable = !app.editing_locked();
+    const std::string lock_hint = editable ? "" : " (stop ducking to change)";
+    items.push_back(make_item(kIdTriggerMenu,
+                              "Trigger: " + trigger_name(config.trigger) + lock_hint, editable,
+                              std::nullopt, make_children(trigger_children(config, editable))));
+    items.push_back(make_item(kIdSourceMenu, "Source: choose" + lock_hint, editable, std::nullopt,
+                              make_children(source_children(editable))));
+    items.push_back(make_item(kIdMicMenu, "Microphone: choose" + lock_hint, editable, std::nullopt,
+                              make_children(mic_children(config, editable))));
+    items.push_back(
+        make_item(kIdProfileMenu, "Profile: " + config.active_profile.value_or("none") + lock_hint,
+                  editable, std::nullopt, make_children(profile_children(config, editable))));
     items.push_back(make_item(kIdTuner, app.tuner_label(), app.tuner_enabled()));
     items.push_back(make_item(kIdQuit, "Quit", !app.quitting));
 
@@ -778,6 +816,9 @@ void select_mic_impl(uint32_t index) {
 }
 
 void TrayApp::select_source(uint32_t index) {
+    if (editing_locked()) {
+        return;
+    }
     try {
         select_source_impl(index);
         source_label = config_source_label();
@@ -794,6 +835,9 @@ void TrayApp::select_source(uint32_t index) {
 }
 
 void TrayApp::select_mic(uint32_t index) {
+    if (editing_locked()) {
+        return;
+    }
     try {
         select_mic_impl(index);
         mic_label = config_mic_label();
@@ -809,7 +853,38 @@ void TrayApp::select_mic(uint32_t index) {
     }
 }
 
+void TrayApp::select_profile(int ordinal) {
+    if (editing_locked()) {
+        return;
+    }
+    try {
+        Config config = Config::load_or_default();
+        int index = 0;
+        for (const auto& [name, profile] : config.profiles) {
+            (void)profile;
+            if (index == ordinal) {
+                config.apply_profile(name);
+                config.save();
+                source_label = config_source_label();
+                mic_label = config_mic_label();
+                message = "Profile: " + name;
+                notify_changed();
+                return;
+            }
+            ++index;
+        }
+        throw std::runtime_error("the selected profile no longer exists");
+    } catch (const std::exception& error) {
+        state = TrayRunState::Error;
+        message = std::string("Could not apply profile: ") + error.what();
+        notify_changed();
+    }
+}
+
 void TrayApp::set_trigger(Trigger trigger) {
+    if (editing_locked()) {
+        return;
+    }
     try {
         Config config = Config::load_or_default();
         config.trigger = trigger;
@@ -1150,6 +1225,14 @@ GVariant* on_sni_get_property(GDBusConnection*, const gchar*, const gchar*, cons
 }
 
 void handle_menu_event(TrayApp& app, int id) {
+    // Hosts sometimes emit clicks for disabled items. Never write routing
+    // configuration or rebuild the session while the worker is active.
+    const bool routing_edit = (id >= kIdTriggerCall && id <= kIdTriggerBoth) ||
+                              (id >= kIdSourceBase && id < kIdSourceGroupBase) ||
+                              id >= kIdProfileBase;
+    if (routing_edit && app.editing_locked()) {
+        return;
+    }
     if (id == kIdToggle) {
         app.request_toggle();
     } else if (id == kIdTriggerCall) {
@@ -1166,6 +1249,8 @@ void handle_menu_event(TrayApp& app, int id) {
         app.select_source(static_cast<uint32_t>(id - kIdSourceBase));
     } else if (id >= kIdMicBase && id < kIdSourceGroupBase) {
         app.select_mic(static_cast<uint32_t>(id - kIdMicBase));
+    } else if (id >= kIdProfileBase) {
+        app.select_profile(id - kIdProfileBase);
     }
     // Group items (kIdSourceGroupBase..) are submenu parents and have no action.
 }

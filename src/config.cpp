@@ -162,6 +162,87 @@ void parse_source_key(ConfiguredSource& source, const std::string& key, const st
         source.node_name = parsed;
 }
 
+void validate_profile_name(const std::string& name) {
+    if (name.empty()) {
+        throw std::runtime_error("profile name must not be empty");
+    }
+    for (const char c : name) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') {
+            throw std::runtime_error("invalid profile name '" + name +
+                                     "' (use letters, digits, '-' or '_')");
+        }
+    }
+}
+
+std::string profile_list(const std::map<std::string, DuckingProfile>& profiles) {
+    std::string result;
+    for (const auto& [name, _] : profiles) {
+        if (!result.empty()) {
+            result += ", ";
+        }
+        result += name;
+    }
+    return result;
+}
+
+void normalize_settings(int& duck_percent, double& vad_threshold,
+                        std::optional<double>& mic_vad_threshold, int& hold_ms, int& attack_fade_ms,
+                        int& release_fade_ms) {
+    duck_percent = std::clamp(duck_percent, 0, 100);
+    vad_threshold = std::clamp(finite_or(vad_threshold, 0.01), 0.0025, 0.2);
+    if (mic_vad_threshold.has_value()) {
+        if (!std::isfinite(*mic_vad_threshold)) {
+            // An invalid optional value falls back to vad_threshold, matching
+            // the "unset" behavior used by older configurations.
+            mic_vad_threshold.reset();
+        } else {
+            mic_vad_threshold = std::clamp(*mic_vad_threshold, 0.0025, 0.2);
+        }
+    }
+    hold_ms = std::clamp(hold_ms, 0, 4000);
+    attack_fade_ms = std::clamp(attack_fade_ms, 0, 2000);
+    release_fade_ms = std::clamp(release_fade_ms, 0, 3000);
+}
+
+void emit_settings(std::ostream& output, int duck_percent, double vad_threshold,
+                   const std::optional<double>& mic_vad_threshold, int hold_ms, int attack_fade_ms,
+                   int release_fade_ms, Trigger trigger, bool always_emit_mic_threshold) {
+    output << "duck_percent = " << duck_percent << "\n"
+           << "vad_threshold = " << format_double(vad_threshold, 4) << "\n";
+    if (always_emit_mic_threshold || mic_vad_threshold.has_value()) {
+        output << "mic_vad_threshold = "
+               << format_double(mic_vad_threshold.value_or(vad_threshold), 4) << "\n";
+    }
+    output << "hold_ms = " << hold_ms << "\n"
+           << "attack_fade_ms = " << attack_fade_ms << "\n"
+           << "release_fade_ms = " << release_fade_ms << "\n"
+           << "trigger = " << quote(trigger_name(trigger)) << "\n";
+}
+
+void emit_source(std::ostream& output, const ConfiguredSource& source) {
+    const auto emit = [&output](const char* key, const std::optional<std::string>& value) {
+        if (value.has_value()) {
+            output << key << " = " << quote(*value) << "\n";
+        }
+    };
+    emit("label", source.label);
+    emit("application_name", source.application_name);
+    emit("application_process_binary", source.application_process_binary);
+    emit("media_name", source.media_name);
+    emit("media_role", source.media_role);
+    emit("media_class", source.media_class);
+    emit("node_name", source.node_name);
+}
+
+void emit_mic(std::ostream& output, const ConfiguredMic& mic) {
+    if (mic.name.has_value()) {
+        output << "name = " << quote(*mic.name) << "\n";
+    }
+    if (mic.label.has_value()) {
+        output << "label = " << quote(*mic.label) << "\n";
+    }
+}
+
 } // namespace
 
 std::string trigger_name(Trigger trigger) {
@@ -198,22 +279,56 @@ Config Config::defaults() {
     return Config{};
 }
 
+DuckingProfile DuckingProfile::from_config(const Config& config) {
+    DuckingProfile profile;
+    profile.duck_percent = config.duck_percent;
+    profile.vad_threshold = config.vad_threshold;
+    profile.mic_vad_threshold = config.mic_vad_threshold;
+    profile.hold_ms = config.hold_ms;
+    profile.attack_fade_ms = config.attack_fade_ms;
+    profile.release_fade_ms = config.release_fade_ms;
+    profile.trigger = config.trigger;
+    profile.voice_source = config.voice_source;
+    profile.mic_source = config.mic_source;
+    return profile;
+}
+
+DuckingProfile DuckingProfile::normalized() const {
+    DuckingProfile result = *this;
+    normalize_settings(result.duck_percent, result.vad_threshold, result.mic_vad_threshold,
+                       result.hold_ms, result.attack_fade_ms, result.release_fade_ms);
+    return result;
+}
+
+void Config::apply_profile(const std::string& name) {
+    const auto found = profiles.find(name);
+    if (found == profiles.end()) {
+        const std::string available = profile_list(profiles);
+        throw std::runtime_error("unknown profile '" + name + "'" +
+                                 (available.empty() ? std::string("; no profiles are configured")
+                                                    : "; available profiles: " + available));
+    }
+    const DuckingProfile profile = found->second.normalized();
+    duck_percent = profile.duck_percent;
+    vad_threshold = profile.vad_threshold;
+    mic_vad_threshold = profile.mic_vad_threshold;
+    hold_ms = profile.hold_ms;
+    attack_fade_ms = profile.attack_fade_ms;
+    release_fade_ms = profile.release_fade_ms;
+    trigger = profile.trigger;
+    voice_source = profile.voice_source;
+    mic_source = profile.mic_source;
+    active_profile = name;
+}
+
 Config Config::normalized() const {
     Config result = *this;
-    result.duck_percent = std::clamp(result.duck_percent, 0, 100);
-    result.vad_threshold = std::clamp(finite_or(result.vad_threshold, 0.01), 0.0025, 0.2);
-    if (result.mic_vad_threshold.has_value()) {
-        if (!std::isfinite(*result.mic_vad_threshold)) {
-            // An invalid optional value falls back to vad_threshold, matching
-            // the "unset" behavior used by older configurations.
-            result.mic_vad_threshold.reset();
-        } else {
-            result.mic_vad_threshold = std::clamp(*result.mic_vad_threshold, 0.0025, 0.2);
-        }
+    normalize_settings(result.duck_percent, result.vad_threshold, result.mic_vad_threshold,
+                       result.hold_ms, result.attack_fade_ms, result.release_fade_ms);
+    for (auto& [name, profile] : result.profiles) {
+        validate_profile_name(name);
+        profile = profile.normalized();
     }
-    result.hold_ms = std::clamp(result.hold_ms, 0, 4000);
-    result.attack_fade_ms = std::clamp(result.attack_fade_ms, 0, 2000);
-    result.release_fade_ms = std::clamp(result.release_fade_ms, 0, 3000);
     return result;
 }
 
@@ -306,41 +421,38 @@ void Config::save() const {
 std::string Config::serialize(const Config& config) {
     std::ostringstream output;
     output << "# pipeduck configuration\n"
-           << "# https://github.com/ErRusso/pipeduck\n\n"
-           << "duck_percent = " << config.duck_percent << "\n"
-           << "vad_threshold = " << format_double(config.vad_threshold, 4) << "\n"
-           << "mic_vad_threshold = "
-           << format_double(config.mic_vad_threshold.value_or(config.vad_threshold), 4) << "\n"
-           << "hold_ms = " << config.hold_ms << "\n"
-           << "attack_fade_ms = " << config.attack_fade_ms << "\n"
-           << "release_fade_ms = " << config.release_fade_ms << "\n"
-           << "trigger = " << quote(trigger_name(config.trigger)) << "\n";
+           << "# https://github.com/ErRusso/pipeduck\n\n";
+    if (config.active_profile.has_value()) {
+        output << "active_profile = " << quote(*config.active_profile) << "\n";
+    }
+    emit_settings(output, config.duck_percent, config.vad_threshold, config.mic_vad_threshold,
+                  config.hold_ms, config.attack_fade_ms, config.release_fade_ms, config.trigger,
+                  true);
 
     if (config.voice_source.has_value()) {
-        const auto& source = *config.voice_source;
         output << "\n[voice_source]\n";
-        const auto emit = [&output](const char* key, const std::optional<std::string>& value) {
-            if (value.has_value()) {
-                output << key << " = " << quote(*value) << "\n";
-            }
-        };
-        emit("label", source.label);
-        emit("application_name", source.application_name);
-        emit("application_process_binary", source.application_process_binary);
-        emit("media_name", source.media_name);
-        emit("media_role", source.media_role);
-        emit("media_class", source.media_class);
-        emit("node_name", source.node_name);
+        emit_source(output, *config.voice_source);
     }
 
     if (config.mic_source.has_value()) {
-        const auto& mic = *config.mic_source;
         output << "\n[mic_source]\n";
-        if (mic.name.has_value()) {
-            output << "name = " << quote(*mic.name) << "\n";
+        emit_mic(output, *config.mic_source);
+    }
+
+    for (const auto& [name, profile] : config.profiles) {
+        validate_profile_name(name);
+        const DuckingProfile normalized = profile.normalized();
+        output << "\n[profiles." << name << "]\n";
+        emit_settings(output, normalized.duck_percent, normalized.vad_threshold,
+                      normalized.mic_vad_threshold, normalized.hold_ms, normalized.attack_fade_ms,
+                      normalized.release_fade_ms, normalized.trigger, false);
+        if (normalized.voice_source.has_value()) {
+            output << "\n[profiles." << name << ".voice_source]\n";
+            emit_source(output, *normalized.voice_source);
         }
-        if (mic.label.has_value()) {
-            output << "label = " << quote(*mic.label) << "\n";
+        if (normalized.mic_source.has_value()) {
+            output << "\n[profiles." << name << ".mic_source]\n";
+            emit_mic(output, *normalized.mic_source);
         }
     }
     return output.str();
@@ -352,7 +464,28 @@ Config Config::parse(const std::string& text) {
     ConfiguredMic mic_source;
     bool has_voice_source = false;
     bool has_mic_source = false;
+
     std::string section;
+    std::string profile_name;
+    enum class ProfilePart { Settings, Voice, Mic };
+    ProfilePart profile_part = ProfilePart::Settings;
+    std::map<std::string, ConfiguredSource> profile_voice;
+    std::map<std::string, ConfiguredMic> profile_mic;
+    std::map<std::string, bool> profile_has_voice;
+    std::map<std::string, bool> profile_has_mic;
+
+    const auto finish_profile = [&]() {
+        if (profile_name.empty()) {
+            return;
+        }
+        DuckingProfile& profile = config.profiles[profile_name];
+        if (profile_has_voice[profile_name]) {
+            profile.voice_source = profile_voice[profile_name];
+        }
+        if (profile_has_mic[profile_name]) {
+            profile.mic_source = profile_mic[profile_name];
+        }
+    };
 
     const auto lines = split_lines(text);
     for (std::size_t index = 0; index < lines.size(); ++index) {
@@ -366,11 +499,38 @@ Config Config::parse(const std::string& text) {
                 throw std::runtime_error("line " + std::to_string(line_number) +
                                          ": malformed table header");
             }
-            section = trim(line.substr(1, line.size() - 2));
-            if (section == "voice_source")
+            const std::string next_section = trim(line.substr(1, line.size() - 2));
+            if (next_section != section) {
+                finish_profile();
+                section = next_section;
+                profile_name.clear();
+                profile_part = ProfilePart::Settings;
+            }
+            const std::string prefix = "profiles.";
+            if (section.rfind(prefix, 0) == 0) {
+                const std::string rest = section.substr(prefix.size());
+                std::string name = rest;
+                const std::string voice_suffix = ".voice_source";
+                const std::string mic_suffix = ".mic_source";
+                if (rest.size() > voice_suffix.size() &&
+                    rest.compare(rest.size() - voice_suffix.size(), voice_suffix.size(),
+                                 voice_suffix) == 0) {
+                    name = rest.substr(0, rest.size() - voice_suffix.size());
+                    profile_part = ProfilePart::Voice;
+                } else if (rest.size() > mic_suffix.size() &&
+                           rest.compare(rest.size() - mic_suffix.size(), mic_suffix.size(),
+                                        mic_suffix) == 0) {
+                    name = rest.substr(0, rest.size() - mic_suffix.size());
+                    profile_part = ProfilePart::Mic;
+                }
+                validate_profile_name(name);
+                profile_name = name;
+                config.profiles.try_emplace(name);
+            } else if (section == "voice_source") {
                 has_voice_source = true;
-            if (section == "mic_source")
+            } else if (section == "mic_source") {
                 has_mic_source = true;
+            }
             continue;
         }
         const auto equals = line.find('=');
@@ -383,6 +543,35 @@ Config Config::parse(const std::string& text) {
         if (key.empty() || value.empty()) {
             throw std::runtime_error("line " + std::to_string(line_number) +
                                      ": expected key = value");
+        }
+
+        if (!profile_name.empty()) {
+            DuckingProfile& profile = config.profiles[profile_name];
+            if (profile_part == ProfilePart::Voice) {
+                profile_has_voice[profile_name] = true;
+                parse_source_key(profile_voice[profile_name], key, value, line_number);
+            } else if (profile_part == ProfilePart::Mic) {
+                profile_has_mic[profile_name] = true;
+                if (key == "name")
+                    profile_mic[profile_name].name = unquote(value, line_number);
+                else if (key == "label")
+                    profile_mic[profile_name].label = unquote(value, line_number);
+            } else if (key == "duck_percent") {
+                profile.duck_percent = parse_int(value, line_number);
+            } else if (key == "vad_threshold") {
+                profile.vad_threshold = parse_double(value, line_number);
+            } else if (key == "mic_vad_threshold") {
+                profile.mic_vad_threshold = parse_double(value, line_number);
+            } else if (key == "hold_ms") {
+                profile.hold_ms = parse_int(value, line_number);
+            } else if (key == "attack_fade_ms") {
+                profile.attack_fade_ms = parse_int(value, line_number);
+            } else if (key == "release_fade_ms") {
+                profile.release_fade_ms = parse_int(value, line_number);
+            } else if (key == "trigger") {
+                profile.trigger = parse_trigger(unquote(value, line_number));
+            }
+            continue;
         }
 
         if (section.empty()) {
@@ -400,6 +589,11 @@ Config Config::parse(const std::string& text) {
                 config.release_fade_ms = parse_int(value, line_number);
             else if (key == "trigger")
                 config.trigger = parse_trigger(unquote(value, line_number));
+            else if (key == "active_profile") {
+                const std::string name = unquote(value, line_number);
+                validate_profile_name(name);
+                config.active_profile = name;
+            }
         } else if (section == "voice_source") {
             has_voice_source = true;
             parse_source_key(voice_source, key, value, line_number);
@@ -412,6 +606,7 @@ Config Config::parse(const std::string& text) {
         }
     }
 
+    finish_profile();
     if (has_voice_source) {
         config.voice_source = voice_source;
     }

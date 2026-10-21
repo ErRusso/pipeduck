@@ -32,6 +32,18 @@ List microphones selectable for microphone-triggered ducking.
 .BI "select-mic " "NAME|ID"
 Save a microphone by source name or index.
 .TP
+.B profiles
+List saved ducking profiles and mark the active one.
+.TP
+.BI "profile-save " NAME
+Save the current settings as a named profile.
+.TP
+.BI "profile-select " NAME
+Apply a saved profile.
+.TP
+.BI "profile-delete " NAME
+Delete a saved profile.
+.TP
 .B tune
 Open the terminal tuner.
 .TP
@@ -91,6 +103,10 @@ Show the version.
 .TP
 .I ~/.config/pipeduck/config.toml
 Configuration file. Changes are polled by a running tray and applied live.
+Named ducking profiles are stored in optional
+.I [profiles.<name>]
+tables. While ducking runs, the tray keeps trigger, source, microphone and
+profile editing locked until it is stopped.
 .SH ENVIRONMENT
 .TP
 .B XDG_CONFIG_HOME

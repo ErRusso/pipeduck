@@ -128,6 +128,9 @@ void print_status(const pipeduck::PulseCtl& pulse, const pipeduck::Config& confi
     }
     const double mic_threshold = config.mic_vad_threshold.value_or(config.vad_threshold);
     std::cout << "Trigger: " << pipeduck::trigger_name(config.trigger) << "\n";
+    if (config.active_profile.has_value()) {
+        std::cout << "Profile: " << *config.active_profile << "\n";
+    }
     std::cout << "Ducking: " << config.duck_percent << "%, hold " << config.hold_ms
               << " ms, return fade " << config.release_fade_ms << " ms\n";
     std::cout << "Thresholds: call " << pipeduck::format_double(config.vad_threshold, 4)
@@ -216,6 +219,51 @@ void select_mic(const pipeduck::PulseCtl& pulse, const std::string& query) {
         std::cout << "Hint: trigger is set to call; use --trigger mic or --trigger both "
                      "to duck for your voice.\n";
     }
+}
+
+void print_profiles(const pipeduck::Config& config) {
+    if (config.profiles.empty()) {
+        std::cout << "No profiles configured. Save one with: pipeduck profile-save NAME\n";
+        return;
+    }
+    std::cout << "Profiles:\n";
+    for (const auto& [name, profile] : config.profiles) {
+        const bool active = config.active_profile.has_value() && *config.active_profile == name;
+        std::cout << "- " << name << (active ? " (active)" : "") << ": duck "
+                  << profile.duck_percent << "%, trigger "
+                  << pipeduck::trigger_name(profile.trigger) << ", hold " << profile.hold_ms
+                  << "ms, return " << profile.release_fade_ms << "ms\n";
+    }
+}
+
+void save_profile(const std::string& name) {
+    pipeduck::Config config = pipeduck::Config::load_or_default();
+    config.profiles[name] = pipeduck::DuckingProfile::from_config(config);
+    config.active_profile = name;
+    config.save();
+    std::cout << "Saved profile: " << name << "\n";
+    std::cout << "Config: " << pipeduck::config_path().string() << "\n";
+}
+
+void select_profile(const std::string& name) {
+    pipeduck::Config config = pipeduck::Config::load_or_default();
+    config.apply_profile(name);
+    config.save();
+    std::cout << "Active profile: " << name << "\n";
+    std::cout << "Ducking: " << config.duck_percent << "%, hold " << config.hold_ms
+              << " ms, trigger " << pipeduck::trigger_name(config.trigger) << "\n";
+}
+
+void delete_profile(const std::string& name) {
+    pipeduck::Config config = pipeduck::Config::load_or_default();
+    if (config.profiles.erase(name) == 0) {
+        throw std::runtime_error("unknown profile '" + name + "'");
+    }
+    if (config.active_profile.has_value() && *config.active_profile == name) {
+        config.active_profile.reset();
+    }
+    config.save();
+    std::cout << "Deleted profile: " << name << "\n";
 }
 
 int run_route(const pipeduck::CliOptions& cli, bool once) {
@@ -344,6 +392,19 @@ int main(int argc, char** argv) {
         }
         case Command::SelectSource:
             select_source(pulse, *cli.sink_input_index);
+            return 0;
+        case Command::Profiles: {
+            print_profiles(Config::load_or_default());
+            return 0;
+        }
+        case Command::ProfileSave:
+            save_profile(*cli.profile_name);
+            return 0;
+        case Command::ProfileSelect:
+            select_profile(*cli.profile_name);
+            return 0;
+        case Command::ProfileDelete:
+            delete_profile(*cli.profile_name);
             return 0;
         case Command::MicSources: {
             const Config config = Config::load_or_default();

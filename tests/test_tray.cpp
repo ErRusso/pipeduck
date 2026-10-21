@@ -18,7 +18,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <string>
+
+#include "pipeduck/config.hpp"
 
 namespace {
 
@@ -121,6 +124,101 @@ void click(const std::string& service, int id) {
     }
 }
 
+GVariant* find_item_props(GVariant* item, int wanted) {
+    int32_t id = 0;
+    GVariant* props = nullptr;
+    GVariant* children = nullptr;
+    g_variant_get(item, "(i@a{sv}@av)", &id, &props, &children);
+    if (id == wanted) {
+        g_variant_unref(children);
+        return props;
+    }
+    GVariantIter iterator;
+    g_variant_iter_init(&iterator, children);
+    GVariant* child = nullptr;
+    while ((child = g_variant_iter_next_value(&iterator)) != nullptr) {
+        GVariant* nested = nullptr;
+        g_variant_get(child, "v", &nested);
+        g_variant_unref(child);
+        if (nested == nullptr) {
+            continue;
+        }
+        GVariant* found = find_item_props(nested, wanted);
+        g_variant_unref(nested);
+        if (found != nullptr) {
+            g_variant_unref(children);
+            g_variant_unref(props);
+            return found;
+        }
+    }
+    g_variant_unref(children);
+    g_variant_unref(props);
+    return nullptr;
+}
+
+struct ItemInfo {
+    bool found = false;
+    bool enabled = false;
+    std::string label;
+    int32_t toggle_state = 0;
+};
+
+ItemInfo item_info(const std::string& service, int id) {
+    ItemInfo info;
+    uint32_t revision = 0;
+    GVariant* layout = get_layout(service, &revision);
+    if (layout == nullptr) {
+        return info;
+    }
+    GVariant* props = find_item_props(layout, id);
+    if (props != nullptr) {
+        info.found = true;
+        GVariant* enabled = g_variant_lookup_value(props, "enabled", G_VARIANT_TYPE_BOOLEAN);
+        info.enabled = enabled != nullptr && g_variant_get_boolean(enabled) == TRUE;
+        if (enabled != nullptr) {
+            g_variant_unref(enabled);
+        }
+        GVariant* label = g_variant_lookup_value(props, "label", G_VARIANT_TYPE_STRING);
+        if (label != nullptr) {
+            info.label = g_variant_get_string(label, nullptr);
+            g_variant_unref(label);
+        }
+        GVariant* toggle = g_variant_lookup_value(props, "toggle-state", G_VARIANT_TYPE_INT32);
+        if (toggle != nullptr) {
+            info.toggle_state = g_variant_get_int32(toggle);
+            g_variant_unref(toggle);
+        }
+        g_variant_unref(props);
+    }
+    g_variant_unref(layout);
+    return info;
+}
+
+bool wait_for_enabled(const std::string& service, int id, bool enabled) {
+    for (int attempt = 0; attempt < 120; ++attempt) {
+        const ItemInfo info = item_info(service, id);
+        if (info.found && info.enabled == enabled) {
+            return true;
+        }
+        g_usleep(50 * 1000);
+    }
+    return false;
+}
+
+void click_group(const std::string& service, std::initializer_list<int> ids) {
+    GVariantBuilder events;
+    g_variant_builder_init(&events, G_VARIANT_TYPE("a(isvu)"));
+    for (const int id : ids) {
+        g_variant_builder_add(&events, "(isvu)", id, "clicked",
+                              g_variant_new_variant(g_variant_new_int32(0)), 0u);
+    }
+    GVariant* reply = call(service, kMenuPath, kMenuInterface, "EventGroup",
+                           g_variant_new("(@a(isvu))", g_variant_builder_end(&events)), nullptr);
+    if (reply != nullptr) {
+        g_variant_unref(reply);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -136,6 +234,34 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(temporary / "config");
     std::filesystem::create_directories(temporary / "runtime");
     const auto config_file = temporary / "config" / "pipeduck" / "config.toml";
+    std::filesystem::create_directories(config_file.parent_path());
+    {
+        std::ofstream out(config_file);
+        out << R"(duck_percent = 25
+vad_threshold = 0.0100
+mic_vad_threshold = 0.0100
+hold_ms = 700
+attack_fade_ms = 80
+release_fade_ms = 320
+trigger = "call"
+
+[profiles.focus]
+duck_percent = 15
+vad_threshold = 0.0100
+hold_ms = 500
+attack_fade_ms = 80
+release_fade_ms = 320
+trigger = "mic"
+
+[profiles.gaming]
+duck_percent = 60
+vad_threshold = 0.0100
+hold_ms = 800
+attack_fade_ms = 80
+release_fade_ms = 320
+trigger = "both"
+)";
+    }
 
     setenv("XDG_CONFIG_HOME", (temporary / "config").c_str(), 1);
     setenv("XDG_RUNTIME_DIR", (temporary / "runtime").c_str(), 1);
@@ -267,6 +393,79 @@ int main(int argc, char** argv) {
             g_variant_unref(second);
         }
         CHECK(before == after);
+
+        // ---- Editing lock and profiles ----------------------------------
+        const auto initial = pipeduck::Config::load();
+        CHECK(initial.profiles.size() == 2);
+        CHECK(!initial.active_profile.has_value());
+
+        // With no worker running, every routing-identity menu is editable.
+        for (const int id : {10, 20, 30, 40, 70}) {
+            const ItemInfo info = item_info(service, id);
+            CHECK(info.found);
+            CHECK(info.enabled);
+        }
+        CHECK(item_info(service, 21).enabled);
+        CHECK(item_info(service, 5000000).found);
+        CHECK(item_info(service, 5000000).enabled);
+
+        uint32_t before_lock_revision = 0;
+        GVariant* before_lock = get_layout(service, &before_lock_revision);
+        if (before_lock != nullptr) {
+            g_variant_unref(before_lock);
+        }
+
+        // Starting ducking locks trigger/source/microphone/profile editing but
+        // keeps the Ducking toggle usable.
+        click(service, 10);
+        CHECK(wait_for_enabled(service, 20, false));
+        CHECK(!item_info(service, 30).enabled);
+        CHECK(!item_info(service, 40).enabled);
+        CHECK(!item_info(service, 70).enabled);
+        CHECK(!item_info(service, 21).enabled);
+        CHECK(!item_info(service, 5000000).enabled);
+        CHECK(item_info(service, 10).enabled);
+        CHECK(item_info(service, 20).label.find("stop ducking") != std::string::npos);
+
+        // The layout revision advances so hosts re-evaluate enabled state.
+        uint32_t locked_revision = 0;
+        GVariant* locked_layout = get_layout(service, &locked_revision);
+        if (locked_layout != nullptr) {
+            g_variant_unref(locked_layout);
+        }
+        CHECK(locked_revision > before_lock_revision);
+
+        // Locked clicks, including the EventGroup path, must not write config
+        // or restart the active session.
+        click(service, 22);
+        click_group(service, {21, 22, 23});
+        g_usleep(200 * 1000);
+        CHECK(pipeduck::Config::load().trigger == pipeduck::Trigger::Call);
+
+        // Stopping ducking re-enables editing without restarting the tray.
+        click(service, 10);
+        CHECK(wait_for_enabled(service, 20, true));
+        CHECK(item_info(service, 30).enabled);
+        CHECK(item_info(service, 40).enabled);
+        CHECK(item_info(service, 70).enabled);
+        CHECK(item_info(service, 10).enabled);
+
+        // Selecting a profile applies it through the normal config path.
+        click(service, 5000000); // sorted first: "focus"
+        bool profile_applied = false;
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            const auto current = pipeduck::Config::load();
+            if (current.active_profile == std::optional<std::string>("focus") &&
+                current.trigger == pipeduck::Trigger::Mic) {
+                profile_applied = true;
+                break;
+            }
+            g_usleep(50 * 1000);
+        }
+        CHECK(profile_applied);
+        CHECK(pipeduck::Config::load().duck_percent == 15);
+        CHECK(item_info(service, 70).label.find("focus") != std::string::npos);
+        CHECK(service_has_owner(service));
 
         GVariantBuilder ids;
         g_variant_builder_init(&ids, G_VARIANT_TYPE("ai"));

@@ -108,6 +108,10 @@ pipeduck sources         # list playback streams selectable as call audio
 pipeduck select-source 5 # save a playback stream by sink-input index
 pipeduck mic-sources     # list microphones
 pipeduck select-mic 64   # save a microphone by index or name
+pipeduck profiles        # list saved ducking profiles
+pipeduck profile-save meeting   # snapshot the current settings as "meeting"
+pipeduck profile-select meeting # apply a saved profile
+pipeduck profile-delete meeting # delete a profile
 pipeduck tune            # terminal tuner
 pipeduck tune-gui        # GTK4 tuner, if built with GUI support
 pipeduck route           # route and duck until Ctrl+C (changes the live graph)
@@ -191,6 +195,38 @@ silently clamped.
 
 The configuration schema is compatible with pw-duck's `config.toml`; missing new keys receive the
 defaults above.
+
+### Profiles
+
+Named profiles bundle the ducking fields above with an optional call source and microphone, so you
+can switch between meeting, gaming and streaming setups without editing the file by hand. Profiles
+live in `[profiles.<name>]` tables; the top-level keys stay authoritative and selecting a profile
+copies its values into them.
+
+```toml
+active_profile = "meeting"
+
+[profiles.meeting]
+duck_percent = 20
+vad_threshold = 0.0100
+hold_ms = 900
+trigger = "both"
+
+[profiles.meeting.voice_source]
+application_name = "Zoom"
+
+[profiles.meeting.mic_source]
+name = "alsa_input.usb-Microphone-00.pro-input-0"
+label = "USB Microphone"
+```
+
+Profile names may contain letters, digits, `-` and `_`. Manage them with `pipeduck profiles`,
+`pipeduck profile-save NAME`, `pipeduck profile-select NAME` and `pipeduck profile-delete NAME`, or
+select one from the tray's **Profile** menu. `pipeduck status` shows the active profile.
+
+While ducking is running, the tray locks the **Trigger**, **Source**, **Microphone** and **Profile**
+menus and labels them with *(stop ducking to change)*. Stop ducking first; the toggle itself always
+stays available. The CLI, both tuners and external `config.toml` edits are unaffected.
 
 ## How it works
 

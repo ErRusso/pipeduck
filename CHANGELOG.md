@@ -6,6 +6,13 @@ All notable changes to PipeDuck are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Named ducking profiles stored in `[profiles.<name>]` tables, with `profiles`, `profile-save`,
+  `profile-select` and `profile-delete` CLI commands and a tray Profile menu.
+- The tray locks trigger, source, microphone and profile editing while ducking is running and
+  explains how to unlock it.
+
 ### Fixed
 
 - The ducking control tick never spawns a `pactl` fallback or blocks on an unavailable audio

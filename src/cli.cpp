@@ -114,6 +114,12 @@ CliOptions parse_cli(int argc, char** argv) {
                 options.source_query = argument;
                 continue;
             }
+            if (options.command == Command::ProfileSave ||
+                options.command == Command::ProfileSelect ||
+                options.command == Command::ProfileDelete) {
+                options.profile_name = argument;
+                continue;
+            }
             throw std::runtime_error("unexpected argument '" + argument + "'");
         }
 
@@ -134,6 +140,14 @@ CliOptions parse_cli(int argc, char** argv) {
             options.command = Command::MicSources;
         else if (argument == "select-mic")
             options.command = Command::SelectMic;
+        else if (argument == "profiles")
+            options.command = Command::Profiles;
+        else if (argument == "profile-save")
+            options.command = Command::ProfileSave;
+        else if (argument == "profile-select")
+            options.command = Command::ProfileSelect;
+        else if (argument == "profile-delete")
+            options.command = Command::ProfileDelete;
         else if (argument == "tune")
             options.command = Command::Tune;
         else if (argument == "tune-gui")
@@ -152,6 +166,11 @@ CliOptions parse_cli(int argc, char** argv) {
     if (options.command == Command::SelectMic && !options.source_query.has_value()) {
         throw std::runtime_error("select-mic expects a source name or index");
     }
+    if ((options.command == Command::ProfileSave || options.command == Command::ProfileSelect ||
+         options.command == Command::ProfileDelete) &&
+        !options.profile_name.has_value()) {
+        throw std::runtime_error("profile commands expect a profile name");
+    }
     return options;
 }
 
@@ -168,6 +187,10 @@ Commands:
   select-source ID     Save a playback stream as the voice-call source
   mic-sources          List microphones selectable for voice ducking
   select-mic NAME|ID   Save a microphone (name, or index from mic-sources)
+  profiles             List ducking profiles
+  profile-save NAME    Save the current settings as a named profile
+  profile-select NAME  Apply a saved profile
+  profile-delete NAME  Delete a saved profile
   tune                 Open the terminal tuner
   tune-gui             Open the GTK4 tuner (if built with GUI support)
   route                Route streams and duck until Ctrl+C (live graph change)
@@ -191,6 +214,8 @@ Examples:
   pipeduck --trigger both
   pipeduck sources && pipeduck select-source 546
   pipeduck select-mic alsa_input.usb-Mic-00.pro-input-0
+  pipeduck profile-save meeting
+  pipeduck profile-select meeting
   pipeduck tune
 )";
 }

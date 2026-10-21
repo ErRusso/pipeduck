@@ -16,6 +16,10 @@ enum class Command {
     SelectSource,
     MicSources,
     SelectMic,
+    Profiles,
+    ProfileSave,
+    ProfileSelect,
+    ProfileDelete,
     Tune,
     TuneGui,
     Route,
@@ -34,6 +38,7 @@ struct CliOptions {
     std::optional<Trigger> trigger;
     std::optional<unsigned> sink_input_index;
     std::optional<std::string> source_query;
+    std::optional<std::string> profile_name;
     unsigned seconds = 5;
     bool yes_really_route = false;
 };
