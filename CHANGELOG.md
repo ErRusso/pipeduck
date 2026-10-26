@@ -4,6 +4,22 @@ All notable changes to PipeDuck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- The shared PulseAudio graph cache reconnects after a failed or lost libpulse connection instead
+  of staying unavailable until the tray restarts. This is what made ducking sit in "waiting" while
+  source menus kept working through the `pactl` fallback (#36).
+- Repeated `Activate` calls from a double click are coalesced, `Scroll` no longer toggles ducking,
+  and `SecondaryActivate` no longer acts as a toggle (#39).
+- Launching `pipeduck` (or the desktop icon) while the tray is running now forwards activation to
+  the running instance instead of exiting silently (#40).
+- Trigger, source, microphone and profile menus stay editable while ducking waits for its
+  configured source, so a lost stream can be replaced without stopping ducking (#38).
+- An incomplete restore no longer disables the Ducking toggle permanently: activating it moves
+  streams off abandoned pipeduck sinks and starts a fresh session (#37).
+
 ## [1.2.0] - 2026-10-21
 
 ### Added

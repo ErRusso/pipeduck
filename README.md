@@ -35,7 +35,8 @@ UI, terminal and GTK4 tuners, smooth volume ramps and microphone-triggered ducki
 - **Safe routing** — temporary virtual sink, automatic stream restore, and a safety fallback that
   leaves the sink alive rather than terminating application audio. Ducking follows default-output
   changes and never overwrites the user's default sink when it stops.
-- **Single instance** — a second tray instance refuses to start.
+- **Single instance** — a second launch (for example from the desktop icon) activates the running
+  tray instead of starting another copy.
 - **CLI** — status, stream discovery, source/mic selection and diagnostic routing.
 
 ## Requirements
@@ -225,8 +226,10 @@ Profile names may contain letters, digits, `-` and `_`. Manage them with `pipedu
 select one from the tray's **Profile** menu. `pipeduck status` shows the active profile.
 
 While ducking is running, the tray locks the **Trigger**, **Source**, **Microphone** and **Profile**
-menus and labels them with *(stop ducking to change)*. Stop ducking first; the toggle itself always
-stays available. The CLI, both tuners and external `config.toml` edits are unaffected.
+menus and labels them with *(stop ducking to change)*. The exception is the *waiting* state: when no
+configured source is playing yet, those menus stay editable so the source can be corrected without
+stopping ducking. The toggle itself always stays available. The CLI, both tuners and external
+`config.toml` edits are unaffected.
 
 ## How it works
 
