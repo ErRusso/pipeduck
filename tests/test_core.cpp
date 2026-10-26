@@ -681,6 +681,40 @@ void test_identity() {
     wrong_binary.application_process_binary = "chromium";
     CHECK(!identity.matches_configured_source(wrong_binary));
 
+    // Stable-identity matching ignores volatile fields but requires the same
+    // application. The voice heuristic already covers known voice apps, so this
+    // is exercised with an application that has no voice hint.
+    pipeduck::ConfiguredSource stable;
+    stable.application_name = "Discord";
+    stable.application_process_binary = "discord";
+    stable.media_class = "Stream/Output/Audio";
+    CHECK(identity.matches_stable_source(stable));
+
+    const auto recreated = pipeduck::AudioIdentity::from_props({
+        {"application.name", "Firefox"},
+        {"application.process.binary", "firefox"},
+        {"media.name", "old-tab"},
+        {"media.class", "Stream/Output/Audio"},
+        {"node.name", "Firefox"},
+    });
+    pipeduck::ConfiguredSource browser;
+    browser.application_process_binary = "firefox";
+    browser.media_class = "Stream/Output/Audio";
+    browser.media_name = "call-tab";
+    browser.node_name = "Firefox";
+    CHECK(!recreated.matches_configured_source(browser));
+    CHECK(recreated.matches_stable_source(browser));
+    // Name-only configuration still works when no binary was stored.
+    pipeduck::ConfiguredSource by_name;
+    by_name.application_name = "Firefox";
+    CHECK(recreated.matches_stable_source(by_name));
+    CHECK(!identity.matches_stable_source(by_name));
+    // No stable anchor means no stable match.
+    pipeduck::ConfiguredSource no_anchor;
+    no_anchor.media_name = "playStream";
+    CHECK(!identity.matches_stable_source(no_anchor));
+    CHECK(!identity.matches_stable_source(wrong_binary));
+
     CHECK(pipeduck::looks_like_voice_text({"something", "WEBRTC"}));
     CHECK(!pipeduck::looks_like_voice_text({"music", "video"}));
 }
@@ -712,6 +746,73 @@ void test_call_target() {
     pipeduck::ConfiguredSource missing;
     missing.application_name = "Not Running";
     CHECK(!pipeduck::find_call_target({input}, missing).has_value());
+}
+
+void test_call_rematch() {
+    g_current_test = "call-rematch";
+
+    auto make_input = [](uint32_t index, const std::string& binary, const std::string& media,
+                         const std::string& serial) {
+        pipeduck::SinkInput sink_input;
+        sink_input.index = index;
+        sink_input.properties = {
+            {"application.name", binary}, {"application.process.binary", binary},
+            {"media.name", media},        {"media.class", "Stream/Output/Audio"},
+            {"object.serial", serial},    {"node.name", binary + "-" + serial},
+        };
+        return sink_input;
+    };
+
+    pipeduck::ConfiguredSource configured;
+    configured.application_process_binary = "firefox";
+    configured.media_class = "Stream/Output/Audio";
+    configured.media_name = "call-tab";
+    const auto before = make_input(42, "firefox", "call-tab", "100");
+    CHECK(pipeduck::resolve_call_target({before}, configured).rematched == false);
+
+    // The stream is re-created by the same application with a new index, media
+    // name and serial (the call moved to the phone and back). The stable
+    // identity still points at it (issue #35).
+    const auto after = make_input(77, "firefox", "call-tab.2", "200");
+    const auto match = pipeduck::resolve_call_target({after}, configured);
+    CHECK(match.target.has_value());
+    CHECK(match.rematched);
+    if (match.target.has_value()) {
+        CHECK(match.target->label == "#77 firefox / firefox / call-tab.2");
+        CHECK(match.target->capture.object_serial == std::optional<std::string>("200"));
+    }
+    // The returned source pins the recovered stream, so routing keeps it out of
+    // ducking and the session can track it after another re-creation.
+    CHECK(pipeduck::AudioIdentity::from_props(after.properties)
+              .matches_configured_source(match.source));
+    const auto again = make_input(91, "firefox", "call-tab.3", "300");
+    CHECK(pipeduck::resolve_call_target({again}, match.source).target.has_value());
+
+    // Two candidates with the same stable identity are ambiguous: waiting is
+    // safer than excluding the wrong stream from ducking.
+    pipeduck::ConfiguredSource firefox;
+    firefox.application_process_binary = "firefox";
+    firefox.media_name = "old-tab";
+    const auto ambiguous = pipeduck::resolve_call_target(
+        {make_input(1, "firefox", "tab-a", "10"), make_input(2, "firefox", "tab-b", "11")},
+        firefox);
+    CHECK(!ambiguous.target.has_value());
+    CHECK(!ambiguous.rematched);
+
+    // A single candidate is still accepted for the same case.
+    const auto unique =
+        pipeduck::resolve_call_target({make_input(3, "firefox", "tab-c", "12")}, firefox);
+    CHECK(unique.target.has_value());
+    CHECK(unique.rematched);
+
+    // A different application is never picked up.
+    CHECK(!pipeduck::resolve_call_target({make_input(4, "chromium", "tab", "13")}, firefox)
+               .target.has_value());
+
+    // An exact match always wins over the stable fallback.
+    const auto exact = pipeduck::resolve_call_target({after}, match.source);
+    CHECK(exact.target.has_value());
+    CHECK(!exact.rematched);
 }
 
 void test_vad() {
@@ -1593,6 +1694,24 @@ void test_tray_state() {
     CHECK(fatal.status.state == TrayState::Error);
     CHECK(fatal.status.message == "boom");
     CHECK(pipeduck::tray_state_attention(fatal.status.state));
+
+    // An incomplete restore is not a dead end: the toggle stays usable so the
+    // user can sweep stranded streams and try again (issue #35).
+    CHECK(pipeduck::tray_can_toggle(TrayState::Error, false));
+    CHECK(pipeduck::tray_can_toggle(TrayState::Waiting, false));
+    CHECK(!pipeduck::tray_can_toggle(TrayState::Starting, false));
+    CHECK(!pipeduck::tray_can_toggle(TrayState::Stopping, false));
+    CHECK(!pipeduck::tray_can_toggle(TrayState::Neutral, true));
+
+    // Routing edits are unlocked while waiting (the source may have to be
+    // replaced) and once the worker is gone, even if its last state was Error.
+    CHECK(!pipeduck::tray_editing_locked(TrayState::Waiting, true, false));
+    CHECK(!pipeduck::tray_editing_locked(TrayState::Error, false, false));
+    CHECK(!pipeduck::tray_editing_locked(TrayState::Idle, false, false));
+    CHECK(pipeduck::tray_editing_locked(TrayState::Neutral, true, false));
+    CHECK(pipeduck::tray_editing_locked(TrayState::Recovering, true, false));
+    CHECK(pipeduck::tray_editing_locked(TrayState::Starting, false, false));
+    CHECK(pipeduck::tray_editing_locked(TrayState::Idle, false, true));
 }
 
 void test_settings() {
@@ -1623,6 +1742,7 @@ int main() {
     test_profiles();
     test_identity();
     test_call_target();
+    test_call_rematch();
     test_vad();
     test_routing_ports();
     test_routing_links();

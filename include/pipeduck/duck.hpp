@@ -49,6 +49,27 @@ struct CallTarget {
 std::optional<CallTarget> find_call_target(const std::vector<SinkInput>& inputs,
                                            const ConfiguredSource& source);
 
+// Result of resolving the configured call stream against the live graph.
+struct CallMatch {
+    // The stream to capture. Empty when the configured stream is missing or the
+    // fallback match is ambiguous.
+    std::optional<CallTarget> target;
+    // Exact identity of the matched stream. Routing sessions use it to exclude
+    // the call stream from ducking even after the application re-created it
+    // with new volatile fields.
+    ConfiguredSource source;
+    // Set when the configured fields no longer matched and a unique stream with
+    // the same stable application identity was used instead.
+    bool rematched = false;
+};
+
+// Exact match first. When the application re-created its stream (the call moved
+// to another device and back) the volatile fields may differ, so a unique
+// candidate matching only the stable application identity is accepted. Two or
+// more candidates are rejected rather than guessed, because excluding the wrong
+// stream from ducking is worse than waiting for the user to re-select it.
+CallMatch resolve_call_target(const std::vector<SinkInput>& inputs, const ConfiguredSource& source);
+
 enum class DuckingEventType {
     WaitingForSource,
     Started,

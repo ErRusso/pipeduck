@@ -194,6 +194,12 @@ to start ducking and stay above 0.75x of it to remain active. The tuners label t
 at the same sensitivity. Non-finite values such as `nan` or `inf` are rejected instead of being
 silently clamped.
 
+If the configured call stream disappears and the application creates a new one (for example a
+Discord call that moves from the desktop to the phone and back), the new stream is matched by the
+application identity even when its index, media name or node name changed. The match is only used
+when it is unambiguous; otherwise the tray waits and the **Source** menu stays editable so the
+stream can be picked manually.
+
 The configuration schema is compatible with pw-duck's `config.toml`; missing new keys receive the
 defaults above.
 

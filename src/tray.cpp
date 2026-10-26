@@ -294,7 +294,7 @@ struct TrayApp {
     }
 
     bool can_toggle() const {
-        return !quitting && state != TrayRunState::Starting && state != TrayRunState::Stopping;
+        return tray_can_toggle(state, quitting);
     }
 
     // Routing identity (trigger, source, microphone, profile) is read-only
@@ -302,13 +302,7 @@ struct TrayApp {
     // its configured source, editing stays open: that is exactly when the
     // selection needs correcting, and the worker reloads the config.
     bool editing_locked() const {
-        if (quitting) {
-            return true;
-        }
-        if (!worker_active.load()) {
-            return state == TrayRunState::Starting || state == TrayRunState::Stopping;
-        }
-        return state != TrayRunState::Waiting;
+        return tray_editing_locked(state, worker_active.load(), quitting);
     }
 
     bool tuner_enabled() const {

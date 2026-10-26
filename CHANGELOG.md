@@ -8,6 +8,10 @@ All notable changes to PipeDuck are documented here. The format follows
 
 ### Fixed
 
+- A call that moves from one device to another and back no longer leaves the tray with both the
+  Ducking toggle and the Source menu disabled. The toggle stays actionable after an incomplete
+  restore, routing menus unlock while ducking waits for its source, and a stream re-created by the
+  same application is re-matched automatically when the match is unambiguous (#35).
 - The shared PulseAudio graph cache reconnects after a failed or lost libpulse connection instead
   of staying unavailable until the tray restarts. This is what made ducking sit in "waiting" while
   source menus kept working through the `pactl` fallback (#36).

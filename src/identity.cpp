@@ -72,6 +72,25 @@ bool AudioIdentity::matches_configured_source(const ConfiguredSource& source) co
     return exact || matches_voice_variant(*this, source);
 }
 
+bool AudioIdentity::matches_stable_source(const ConfiguredSource& source) const {
+    if (!is_playback_stream()) {
+        return false;
+    }
+    if (!field_matches(source.media_class, media_class)) {
+        return false;
+    }
+    // The process binary is the most reliable anchor; fall back to the
+    // application name when the source was configured without one.
+    if (source.application_process_binary.has_value() &&
+        !source.application_process_binary->empty()) {
+        return same_present_value(source.application_process_binary, application_process_binary);
+    }
+    if (source.application_name.has_value() && !source.application_name->empty()) {
+        return same_present_value(source.application_name, application_name);
+    }
+    return false;
+}
+
 bool AudioIdentity::is_playback_stream() const {
     return media_class.has_value() && *media_class == "Stream/Output/Audio";
 }
