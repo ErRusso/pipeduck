@@ -36,10 +36,6 @@ void interruptible_sleep(const std::atomic<bool>& stop, std::chrono::millisecond
     }
 }
 
-std::optional<CallTarget> find_call_target(const PulseCtl& pulse, const ConfiguredSource& source) {
-    return find_call_target(pulse.sink_inputs(), source);
-}
-
 std::optional<CaptureTarget> find_mic_target(const PulseCtl& pulse, const Config& config) {
     const auto sources = pulse.sources();
     std::vector<Source> candidates;
@@ -113,6 +109,20 @@ std::string capture_label(const std::optional<CallTarget>& call,
 
 enum class SessionEnd { StopRequested, SourceChanged, SinkChanged, RoutingFailed };
 
+CallTarget call_target_for(const SinkInput& input) {
+    const AudioIdentity identity = input.identity();
+    const std::string label = "#" + std::to_string(input.index) + " " + source_label(identity);
+    CaptureTarget capture;
+    capture.label = label;
+    capture.node_name = identity.node_name;
+    const auto serial = input.properties.find("object.serial");
+    if (serial != input.properties.end() && !serial->second.empty()) {
+        capture.object_serial = serial->second;
+    }
+    capture.sink_monitor = true;
+    return CallTarget{std::move(capture), label};
+}
+
 } // namespace
 
 std::optional<CallTarget> find_call_target(const std::vector<SinkInput>& inputs,
@@ -121,22 +131,43 @@ std::optional<CallTarget> find_call_target(const std::vector<SinkInput>& inputs,
         if (!input.identity().matches_configured_source(source)) {
             continue;
         }
-        const AudioIdentity identity = input.identity();
-        const std::string label = "#" + std::to_string(input.index) + " " + source_label(identity);
-        CaptureTarget target;
-        target.label = label;
-        target.node_name = identity.node_name;
-        const auto serial = input.properties.find("object.serial");
-        if (serial != input.properties.end() && !serial->second.empty()) {
-            target.object_serial = serial->second;
-        }
-        target.sink_monitor = true;
-        CallTarget result;
-        result.capture = std::move(target);
-        result.label = label;
-        return result;
+        return call_target_for(input);
     }
     return std::nullopt;
+}
+
+CallMatch resolve_call_target(const std::vector<SinkInput>& inputs,
+                              const ConfiguredSource& source) {
+    CallMatch match;
+    if (const auto exact = find_call_target(inputs, source); exact.has_value()) {
+        match.target = exact;
+        match.source = source;
+        return match;
+    }
+
+    // The configured stream is gone. Accept a single remaining stream with the
+    // same stable application identity: that is what a stream re-created by the
+    // same application looks like. Anything ambiguous stays unmatched.
+    const SinkInput* candidate = nullptr;
+    for (const auto& input : inputs) {
+        if (!input.identity().matches_stable_source(source)) {
+            continue;
+        }
+        if (candidate != nullptr) {
+            return match;
+        }
+        candidate = &input;
+    }
+    if (candidate == nullptr) {
+        return match;
+    }
+
+    match.target = call_target_for(*candidate);
+    // Pin the exact identity of the recovered stream so routing keeps excluding
+    // it from ducking.
+    match.source = configured_source_from_identity(match.target->label, candidate->identity());
+    match.rematched = true;
+    return match;
 }
 
 DuckingSettings DuckingSettings::normalized() const {
@@ -199,6 +230,7 @@ void ensure_route_acknowledged(const std::string& command, bool yes_really_route
 void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, bool reload_config,
                        const DuckingCallback& on_event) {
     bool waiting_reported = false;
+    std::string reported_rematch;
 
     const auto report_waiting = [&](const std::string& message) {
         if (!waiting_reported) {
@@ -238,15 +270,32 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
         std::optional<CaptureTarget> mic;
         std::optional<ConfiguredSource> exclusion;
 
+        // Exact identity of the stream currently standing in for the configured
+        // source. Set when the configured stream was re-created by the same
+        // application after the call moved away and back (issue #35).
+        ConfiguredSource call_source;
+        bool have_call_source = false;
+
         if (config.voice_source.has_value()) {
             try {
-                auto maybe_call = find_call_target(PulseCtl{false}, *config.voice_source);
-                if (maybe_call.has_value()) {
+                const CallMatch match =
+                    resolve_call_target(PulseCtl{false}.sink_inputs(), *config.voice_source);
+                if (match.target.has_value()) {
                     // The configured call stream is excluded from ducking even in
                     // microphone-only mode, and its sink becomes the routing target.
-                    exclusion = config.voice_source;
+                    call_source = match.source;
+                    have_call_source = true;
+                    exclusion = match.source;
                     if (wants_call) {
-                        call = std::move(maybe_call);
+                        call = match.target;
+                    }
+                    if (match.rematched && match.target->label != reported_rematch) {
+                        reported_rematch = match.target->label;
+                        DuckingEvent event;
+                        event.type = DuckingEventType::Message;
+                        event.message =
+                            "The configured source was re-created; matching " + match.target->label;
+                        on_event(event);
                     }
                 }
             } catch (const std::exception&) {
@@ -373,6 +422,22 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
         auto next_config_reload = std::chrono::steady_clock::now();
         SessionEnd end = SessionEnd::StopRequested;
 
+        // Locates the stream that currently stands in for the configured
+        // source. Returns false when the graph could not be inspected, so a
+        // transient backend hiccup is not mistaken for a vanished stream.
+        const auto lookup_call = [&](std::optional<CallTarget>& out) {
+            if (!have_call_source) {
+                out.reset();
+                return true;
+            }
+            try {
+                out = resolve_call_target(PulseCtl{false}.sink_inputs(), call_source).target;
+                return true;
+            } catch (const std::exception&) {
+                return false;
+            }
+        };
+
         const auto report_degraded = [&](bool& flag, const std::string& message) {
             if (flag) {
                 return;
@@ -403,21 +468,16 @@ void run_until_stopped(const std::atomic<bool>& stop, SettingsStore& settings, b
             }
 
             if (now >= next_source_check) {
-                if (call.has_value()) {
-                    const auto current_call =
-                        config.voice_source.has_value()
-                            ? find_call_target(PulseCtl{false}, *config.voice_source)
-                            : std::nullopt;
-                    if (!current_call.has_value() ||
-                        !same_stream(current_call->capture, call->capture)) {
+                std::optional<CallTarget> current_call;
+                if (lookup_call(current_call)) {
+                    if (call.has_value() && (!current_call.has_value() ||
+                                             !same_stream(current_call->capture, call->capture))) {
                         end = SessionEnd::SourceChanged;
                         break;
                     }
-                } else if (trigger == Trigger::Both && config.voice_source.has_value()) {
-                    // A call may start after mic ducking is already running.
-                    const auto current_call =
-                        find_call_target(PulseCtl{false}, *config.voice_source);
-                    if (current_call.has_value()) {
+                    if (!call.has_value() && trigger == Trigger::Both && have_call_source &&
+                        current_call.has_value()) {
+                        // A call may start after mic ducking is already running.
                         end = SessionEnd::SourceChanged;
                         break;
                     }

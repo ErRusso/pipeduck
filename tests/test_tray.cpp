@@ -102,18 +102,6 @@ bool wait_for_service(const std::string& name) {
     return false;
 }
 
-bool wait_for_file_text(const std::filesystem::path& path, const std::string& needle) {
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        std::ifstream input(path);
-        std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-        if (text.find(needle) != std::string::npos) {
-            return true;
-        }
-        g_usleep(50 * 1000);
-    }
-    return false;
-}
-
 void click(const std::string& service, int id) {
     GVariant* reply = call(
         service, kMenuPath, kMenuInterface, "Event",
@@ -122,6 +110,49 @@ void click(const std::string& service, int id) {
     if (reply != nullptr) {
         g_variant_unref(reply);
     }
+}
+
+void activate(const std::string& service) {
+    GVariant* reply =
+        call(service, kSniPath, kSniInterface, "Activate", g_variant_new("(ii)", 0, 0), nullptr);
+    if (reply != nullptr) {
+        g_variant_unref(reply);
+    }
+}
+
+void scroll(const std::string& service) {
+    GVariant* reply = call(service, kSniPath, kSniInterface, "Scroll",
+                           g_variant_new("(is)", 1, "vertical"), nullptr);
+    if (reply != nullptr) {
+        g_variant_unref(reply);
+    }
+}
+
+std::string title(const std::string& service) {
+    GVariant* reply = call(service, kSniPath, "org.freedesktop.DBus.Properties", "Get",
+                           g_variant_new("(ss)", kSniInterface, "Title"), G_VARIANT_TYPE("(v)"));
+    if (reply == nullptr) {
+        return {};
+    }
+    GVariant* variant = nullptr;
+    g_variant_get(reply, "(v)", &variant);
+    std::string value;
+    if (variant != nullptr) {
+        value = g_variant_get_string(variant, nullptr);
+        g_variant_unref(variant);
+    }
+    g_variant_unref(reply);
+    return value;
+}
+
+bool wait_for_title(const std::string& service, const std::string& needle) {
+    for (int attempt = 0; attempt < 120; ++attempt) {
+        if (title(service).find(needle) != std::string::npos) {
+            return true;
+        }
+        g_usleep(50 * 1000);
+    }
+    return false;
 }
 
 GVariant* find_item_props(GVariant* item, int wanted) {
@@ -192,17 +223,6 @@ ItemInfo item_info(const std::string& service, int id) {
     }
     g_variant_unref(layout);
     return info;
-}
-
-bool wait_for_enabled(const std::string& service, int id, bool enabled) {
-    for (int attempt = 0; attempt < 120; ++attempt) {
-        const ItemInfo info = item_info(service, id);
-        if (info.found && info.enabled == enabled) {
-            return true;
-        }
-        g_usleep(50 * 1000);
-    }
-    return false;
 }
 
 void click_group(const std::string& service, std::initializer_list<int> ids) {
@@ -415,17 +435,19 @@ trigger = "both"
             g_variant_unref(before_lock);
         }
 
-        // Starting ducking locks trigger/source/microphone/profile editing but
-        // keeps the Ducking toggle usable.
+        // Starting ducking with no reachable audio backend leaves the worker in
+        // Waiting. Routing selection must stay editable so the source can be
+        // corrected without stopping the worker (issue #38).
         click(service, 10);
-        CHECK(wait_for_enabled(service, 20, false));
-        CHECK(!item_info(service, 30).enabled);
-        CHECK(!item_info(service, 40).enabled);
-        CHECK(!item_info(service, 70).enabled);
-        CHECK(!item_info(service, 21).enabled);
-        CHECK(!item_info(service, 5000000).enabled);
+        CHECK(wait_for_title(service, "Ducking ON"));
         CHECK(item_info(service, 10).enabled);
-        CHECK(item_info(service, 20).label.find("stop ducking") != std::string::npos);
+        CHECK(item_info(service, 20).enabled);
+        CHECK(item_info(service, 30).enabled);
+        CHECK(item_info(service, 40).enabled);
+        CHECK(item_info(service, 70).enabled);
+        CHECK(item_info(service, 21).enabled);
+        CHECK(item_info(service, 5000000).enabled);
+        CHECK(item_info(service, 20).label.find("stop ducking") == std::string::npos);
 
         // The layout revision advances so hosts re-evaluate enabled state.
         uint32_t locked_revision = 0;
@@ -435,20 +457,88 @@ trigger = "both"
         }
         CHECK(locked_revision > before_lock_revision);
 
-        // Locked clicks, including the EventGroup path, must not write config
-        // or restart the active session.
-        click(service, 22);
-        click_group(service, {21, 22, 23});
-        g_usleep(200 * 1000);
-        CHECK(pipeduck::Config::load().trigger == pipeduck::Trigger::Call);
+        // Trigger changes while waiting are applied through both Event paths.
+        click_group(service, {22});
+        bool trigger_applied = false;
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            if (pipeduck::Config::load().trigger == pipeduck::Trigger::Mic) {
+                trigger_applied = true;
+                break;
+            }
+            g_usleep(50 * 1000);
+        }
+        CHECK(trigger_applied);
+        click(service, 21);
+        bool trigger_restored = false;
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            if (pipeduck::Config::load().trigger == pipeduck::Trigger::Call) {
+                trigger_restored = true;
+                break;
+            }
+            g_usleep(50 * 1000);
+        }
+        CHECK(trigger_restored);
 
-        // Stopping ducking re-enables editing without restarting the tray.
-        click(service, 10);
-        CHECK(wait_for_enabled(service, 20, true));
-        CHECK(item_info(service, 30).enabled);
-        CHECK(item_info(service, 40).enabled);
-        CHECK(item_info(service, 70).enabled);
-        CHECK(item_info(service, 10).enabled);
+        // Activation is debounced: a double click must leave ducking ON
+        // (issue #39).
+        g_usleep(500 * 1000);
+        activate(service);
+        CHECK(wait_for_title(service, "Ducking OFF"));
+        g_usleep(500 * 1000);
+        activate(service);
+        g_usleep(50 * 1000);
+        activate(service);
+        CHECK(wait_for_title(service, "Ducking ON"));
+        g_usleep(300 * 1000);
+        CHECK(title(service).find("Ducking ON") != std::string::npos);
+
+        // Scroll must not toggle.
+        scroll(service);
+        g_usleep(500 * 1000);
+        CHECK(title(service).find("Ducking ON") != std::string::npos);
+
+        // A single activation outside the debounce window still toggles.
+        g_usleep(500 * 1000);
+        activate(service);
+        CHECK(wait_for_title(service, "Ducking OFF"));
+
+        // Launching a second tray forwards activation to the running one
+        // (issue #40).
+        g_usleep(500 * 1000);
+        gchar* second_argv[] = {const_cast<gchar*>(argv[1]), const_cast<gchar*>("tray"), nullptr};
+        GPid second_pid = 0;
+        GError* spawn_error = nullptr;
+        const gboolean spawned =
+            g_spawn_async(nullptr, second_argv, nullptr, G_SPAWN_DO_NOT_REAP_CHILD, nullptr,
+                          nullptr, &second_pid, &spawn_error);
+        CHECK(spawned);
+        if (spawn_error != nullptr) {
+            g_error_free(spawn_error);
+        }
+        int second_status = -1;
+        bool second_exited = false;
+        if (spawned) {
+            for (int attempt = 0; attempt < 200; ++attempt) {
+                if (waitpid(second_pid, &second_status, WNOHANG) == second_pid) {
+                    second_exited = true;
+                    break;
+                }
+                g_usleep(50 * 1000);
+            }
+            if (!second_exited) {
+                kill(second_pid, SIGKILL);
+                waitpid(second_pid, nullptr, 0);
+            }
+            g_spawn_close_pid(second_pid);
+        }
+        CHECK(second_exited);
+        CHECK(g_spawn_check_wait_status(second_status, nullptr));
+        CHECK(wait_for_title(service, "Ducking ON"));
+
+        // Leave the tray idle before exercising profiles.
+        g_usleep(500 * 1000);
+        activate(service);
+        CHECK(wait_for_title(service, "Ducking OFF"));
 
         // Selecting a profile applies it through the normal config path.
         click(service, 5000000); // sorted first: "focus"
@@ -484,9 +574,17 @@ trigger = "both"
             g_variant_unref(group);
         }
 
-        // Clicking "My microphone" must update config.toml.
-        click(service, 22);
-        CHECK(wait_for_file_text(config_file, "trigger = \"mic\""));
+        // Clicking a trigger must update config.toml.
+        click(service, 23);
+        bool both_applied = false;
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            if (pipeduck::Config::load().trigger == pipeduck::Trigger::Both) {
+                both_applied = true;
+                break;
+            }
+            g_usleep(50 * 1000);
+        }
+        CHECK(both_applied);
 
         // Quit through the menu.
         click(service, 60);

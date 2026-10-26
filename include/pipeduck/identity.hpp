@@ -17,6 +17,10 @@ struct AudioIdentity {
 
     static AudioIdentity from_props(const StringMap& props);
     bool matches_configured_source(const ConfiguredSource& source) const;
+    // Compares only the fields an application keeps across restarts (binary or
+    // application name, plus the media class). Used as a fallback when the
+    // configured stream was re-created with new volatile fields.
+    bool matches_stable_source(const ConfiguredSource& source) const;
     bool is_playback_stream() const;
     bool looks_like_voice_source() const;
     std::string label() const;

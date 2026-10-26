@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -173,11 +174,15 @@ struct PulseCache::Impl {
         std::vector<Sink> sinks;
         std::vector<Source> sources;
         std::vector<SinkInput> sink_inputs;
+        // Kept until the completion callback so teardown can cancel it instead
+        // of freeing the request while a callback might still be queued.
+        pa_operation* operation = nullptr;
     };
 
     pa_threaded_mainloop* mainloop = nullptr;
     pa_context* context = nullptr;
     std::atomic<bool> ready{false};
+    std::atomic<bool> populated{false};
     std::atomic<bool> failed{false};
     std::atomic<uint64_t> revision{0};
 
@@ -188,23 +193,34 @@ struct PulseCache::Impl {
     std::string default_sink;
     std::string default_source;
 
+    // Reconnection state. `reconnector` rebuilds the libpulse context after an
+    // initial failure or a later disconnect. The wait is bounded so a server
+    // that accepts the socket but never answers cannot wedge the cache.
+    std::atomic<bool> stopping{false};
+    std::thread reconnector;
+    std::mutex retry_mutex;
+    std::condition_variable retry_cv;
+    bool retry_requested = false;
+
     // Accessed only while the threaded mainloop is locked.
     int pending = 0;
+    bool listing = false;
     uint64_t sink_serial = 0;
     uint64_t source_serial = 0;
     uint64_t sink_input_serial = 0;
+    std::vector<ListRequest*> inflight;
 
     static void state_callback(pa_context* context, void* userdata) {
         auto* self = static_cast<Impl*>(userdata);
         switch (pa_context_get_state(context)) {
         case PA_CONTEXT_READY:
-            self->ready.store(true);
             self->failed.store(false);
+            self->ready.store(true);
+            self->begin_listing();
             break;
         case PA_CONTEXT_FAILED:
         case PA_CONTEXT_TERMINATED:
-            self->ready.store(false);
-            self->failed.store(true);
+            self->mark_failed();
             break;
         default:
             break;
@@ -212,13 +228,66 @@ struct PulseCache::Impl {
         pa_threaded_mainloop_signal(self->mainloop, 0);
     }
 
+    // Caller holds the threaded mainloop lock.
+    void mark_failed() {
+        ready.store(false);
+        populated.store(false);
+        failed.store(true);
+        {
+            std::lock_guard<std::mutex> lock(retry_mutex);
+            retry_requested = true;
+        }
+        retry_cv.notify_all();
+    }
+
+    // Caller holds the threaded mainloop lock. Subscribes and queues the initial
+    // snapshots; `populated` only flips once every snapshot has completed.
+    void begin_listing() {
+        if (context == nullptr || failed.load()) {
+            return;
+        }
+        listing = true;
+        populated.store(false);
+        pending = 0;
+
+        pa_context_set_subscribe_callback(context, &Impl::subscribe_callback, this);
+        const auto mask = static_cast<pa_subscription_mask_t>(
+            PA_SUBSCRIPTION_MASK_SERVER | PA_SUBSCRIPTION_MASK_SINK | PA_SUBSCRIPTION_MASK_SOURCE |
+            PA_SUBSCRIPTION_MASK_SINK_INPUT);
+        pa_operation* subscribe = pa_context_subscribe(context, mask, nullptr, nullptr);
+        if (subscribe == nullptr) {
+            listing = false;
+            mark_failed();
+            return;
+        }
+        pa_operation_unref(subscribe);
+
+        request_server();
+        if (!failed.load()) {
+            request_sinks();
+        }
+        if (!failed.load()) {
+            request_sources();
+        }
+        if (!failed.load()) {
+            request_sink_inputs();
+        }
+        listing = false;
+        if (!failed.load() && pending == 0) {
+            populated.store(true);
+            retry_cv.notify_all();
+        }
+    }
+
     static void finish_pending(Impl* self) {
         if (self->pending > 0) {
             --self->pending;
         }
-        if (self->pending == 0) {
-            pa_threaded_mainloop_signal(self->mainloop, 0);
+        if (!self->listing && self->pending == 0 && self->ready.load() && !self->failed.load()) {
+            self->populated.store(true);
+            self->retry_cv.notify_all();
         }
+        pa_threaded_mainloop_signal(self->mainloop, 0);
     }
 
     static void apply_properties(pa_proplist* properties, StringMap& out) {
@@ -269,6 +338,10 @@ struct PulseCache::Impl {
                 break;
             }
             revision.fetch_add(1);
+        }
+        inflight.erase(std::remove(inflight.begin(), inflight.end(), request), inflight.end());
+        if (request->operation != nullptr) {
+            pa_operation_unref(request->operation);
         }
         delete request;
         finish_pending(this);
@@ -368,56 +441,74 @@ struct PulseCache::Impl {
     }
 
     void request_server() {
+        if (context == nullptr || !ready.load() || failed.load()) {
+            return;
+        }
         ++pending;
         pa_operation* operation =
             pa_context_get_server_info(context, &Impl::server_info_callback, this);
         if (operation == nullptr) {
-            finish_pending(this);
+            mark_failed();
             return;
         }
         pa_operation_unref(operation);
     }
 
     void request_sinks() {
+        if (context == nullptr || !ready.load() || failed.load()) {
+            return;
+        }
         const uint64_t serial = ++sink_serial;
-        auto* request = new ListRequest{this, Facility::Sinks, serial, {}, {}, {}};
+        auto* request = new ListRequest{this, Facility::Sinks, serial, {}, {}, {}, nullptr};
+        inflight.push_back(request);
         ++pending;
         pa_operation* operation =
             pa_context_get_sink_info_list(context, &Impl::sink_info_callback, request);
         if (operation == nullptr) {
+            inflight.erase(std::remove(inflight.begin(), inflight.end(), request), inflight.end());
             delete request;
-            finish_pending(this);
+            mark_failed();
             return;
         }
-        pa_operation_unref(operation);
+        request->operation = operation;
     }
 
     void request_sources() {
+        if (context == nullptr || !ready.load() || failed.load()) {
+            return;
+        }
         const uint64_t serial = ++source_serial;
-        auto* request = new ListRequest{this, Facility::Sources, serial, {}, {}, {}};
+        auto* request = new ListRequest{this, Facility::Sources, serial, {}, {}, {}, nullptr};
+        inflight.push_back(request);
         ++pending;
         pa_operation* operation =
             pa_context_get_source_info_list(context, &Impl::source_info_callback, request);
         if (operation == nullptr) {
+            inflight.erase(std::remove(inflight.begin(), inflight.end(), request), inflight.end());
             delete request;
-            finish_pending(this);
+            mark_failed();
             return;
         }
-        pa_operation_unref(operation);
+        request->operation = operation;
     }
 
     void request_sink_inputs() {
+        if (context == nullptr || !ready.load() || failed.load()) {
+            return;
+        }
         const uint64_t serial = ++sink_input_serial;
-        auto* request = new ListRequest{this, Facility::SinkInputs, serial, {}, {}, {}};
+        auto* request = new ListRequest{this, Facility::SinkInputs, serial, {}, {}, {}, nullptr};
+        inflight.push_back(request);
         ++pending;
         pa_operation* operation =
             pa_context_get_sink_input_info_list(context, &Impl::sink_input_info_callback, request);
         if (operation == nullptr) {
+            inflight.erase(std::remove(inflight.begin(), inflight.end(), request), inflight.end());
             delete request;
-            finish_pending(this);
+            mark_failed();
             return;
         }
-        pa_operation_unref(operation);
+        request->operation = operation;
     }
 
     Impl() {
@@ -432,56 +523,43 @@ struct PulseCache::Impl {
             failed.store(true);
             return;
         }
-        pa_threaded_mainloop_lock(mainloop);
-        context = pa_context_new(pa_threaded_mainloop_get_api(mainloop), "pipeduck-cache");
-        if (context == nullptr) {
-            pa_threaded_mainloop_unlock(mainloop);
-            failed.store(true);
-            return;
+        connect_context();
+        {
+            std::lock_guard<std::mutex> lock(retry_mutex);
+            retry_requested = failed.load();
         }
-        pa_context_set_state_callback(context, &Impl::state_callback, this);
-        if (pa_context_connect(context, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) {
-            failed.store(true);
-        }
-        while (!ready.load() && !failed.load()) {
-            pa_threaded_mainloop_wait(mainloop);
-        }
-        if (ready.load() && !failed.load()) {
-            pa_context_set_subscribe_callback(context, &Impl::subscribe_callback, this);
-            const auto mask = static_cast<pa_subscription_mask_t>(
-                PA_SUBSCRIPTION_MASK_SERVER | PA_SUBSCRIPTION_MASK_SINK |
-                PA_SUBSCRIPTION_MASK_SOURCE | PA_SUBSCRIPTION_MASK_SINK_INPUT);
-            if (pa_operation* operation = pa_context_subscribe(context, mask, nullptr, nullptr)) {
-                pa_operation_unref(operation);
-            } else {
+        reconnector = std::thread([this] {
+            try {
+                reconnect_loop();
+            } catch (...) {
+                // A background thread must never terminate the process.
+                ready.store(false);
+                populated.store(false);
                 failed.store(true);
             }
-            if (!failed.load()) {
-                request_server();
-                request_sinks();
-                request_sources();
-                request_sink_inputs();
-                while (pending > 0 && !failed.load()) {
-                    pa_threaded_mainloop_wait(mainloop);
-                }
-            }
-        }
-        pa_threaded_mainloop_unlock(mainloop);
-        if (failed.load()) {
-            ready.store(false);
+        });
+
+        // Give a healthy server a moment to publish its first snapshot so the
+        // first query does not fall back unnecessarily. Never block forever;
+        // if the attempt is still pending afterwards, retry it in the background.
+        std::unique_lock<std::mutex> lock(retry_mutex);
+        retry_cv.wait_for(lock, std::chrono::milliseconds(750),
+                          [this] { return stopping.load() || populated.load() || failed.load(); });
+        if (!populated.load() && !failed.load()) {
+            retry_requested = true;
+            retry_cv.notify_all();
         }
     }
 
     ~Impl() {
+        stopping.store(true);
+        retry_cv.notify_all();
+        if (reconnector.joinable()) {
+            reconnector.join();
+        }
         if (mainloop != nullptr) {
             pa_threaded_mainloop_lock(mainloop);
-        }
-        if (context != nullptr) {
-            pa_context_disconnect(context);
-            pa_context_unref(context);
-            context = nullptr;
-        }
-        if (mainloop != nullptr) {
+            teardown_context_locked();
             pa_threaded_mainloop_unlock(mainloop);
             pa_threaded_mainloop_stop(mainloop);
             pa_threaded_mainloop_free(mainloop);
@@ -489,8 +567,92 @@ struct PulseCache::Impl {
         }
     }
 
+    // Caller holds the threaded mainloop lock.
+    void teardown_context_locked() {
+        for (ListRequest* request : inflight) {
+            if (request->operation != nullptr) {
+                pa_operation_cancel(request->operation);
+                pa_operation_unref(request->operation);
+            }
+            delete request;
+        }
+        inflight.clear();
+        pending = 0;
+        listing = false;
+        if (context != nullptr) {
+            pa_context_set_state_callback(context, nullptr, nullptr);
+            pa_context_set_subscribe_callback(context, nullptr, nullptr);
+            pa_context_disconnect(context);
+            pa_context_unref(context);
+            context = nullptr;
+        }
+        ready.store(false);
+        populated.store(false);
+    }
+
+    void connect_context() {
+        pa_threaded_mainloop_lock(mainloop);
+        if (stopping.load()) {
+            pa_threaded_mainloop_unlock(mainloop);
+            return;
+        }
+        teardown_context_locked();
+        failed.store(false);
+        context = pa_context_new(pa_threaded_mainloop_get_api(mainloop), "pipeduck-cache");
+        if (context == nullptr) {
+            failed.store(true);
+        } else {
+            pa_context_set_state_callback(context, &Impl::state_callback, this);
+            if (pa_context_connect(context, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) {
+                failed.store(true);
+            }
+        }
+        pa_threaded_mainloop_unlock(mainloop);
+        {
+            std::lock_guard<std::mutex> lock(retry_mutex);
+            retry_requested = failed.load();
+        }
+        retry_cv.notify_all();
+    }
+
+    void reconnect_loop() {
+        constexpr auto initial_backoff = std::chrono::milliseconds(500);
+        constexpr auto max_backoff = std::chrono::milliseconds(5000);
+        auto backoff = initial_backoff;
+
+        std::unique_lock<std::mutex> lock(retry_mutex);
+        while (!stopping.load()) {
+            retry_cv.wait(lock, [this] { return stopping.load() || retry_requested; });
+            if (stopping.load()) {
+                break;
+            }
+            retry_requested = false;
+            lock.unlock();
+
+            connect_context();
+
+            // The state callback signals us when the context is ready and the
+            // first snapshot is complete, or when the attempt failed. Bound the
+            // wait so a wedged socket cannot stall reconnection forever.
+            lock.lock();
+            retry_cv.wait_for(lock, std::chrono::seconds(2), [this] {
+                return stopping.load() || populated.load() || failed.load();
+            });
+            const bool healthy = populated.load() && !failed.load();
+            if (healthy) {
+                backoff = initial_backoff;
+                // Keep the lock held: the loop starts with a locked wait.
+                continue;
+            }
+
+            retry_cv.wait_for(lock, backoff, [this] { return stopping.load(); });
+            backoff = std::min(backoff * 2, max_backoff);
+            retry_requested = true;
+        }
+    }
+
     bool available() const {
-        return mainloop != nullptr && context != nullptr && ready.load() && !failed.load();
+        return mainloop != nullptr && ready.load() && !failed.load() && populated.load();
     }
 };
 
@@ -620,7 +782,7 @@ bool PulseCache::move_sink_input_to_index(uint32_t input_index, uint32_t sink_in
         return false;
     }
     pa_threaded_mainloop_lock(impl_->mainloop);
-    if (!impl_->ready.load()) {
+    if (!impl_->ready.load() || impl_->context == nullptr) {
         pa_threaded_mainloop_unlock(impl_->mainloop);
         return false;
     }
@@ -639,7 +801,7 @@ bool PulseCache::set_default_sink(const std::string& sink_name) const {
         return false;
     }
     pa_threaded_mainloop_lock(impl_->mainloop);
-    if (!impl_->ready.load()) {
+    if (!impl_->ready.load() || impl_->context == nullptr) {
         pa_threaded_mainloop_unlock(impl_->mainloop);
         return false;
     }
@@ -662,7 +824,7 @@ bool PulseCache::set_source_volume_percent(const std::string& source_name, doubl
     pa_cvolume channel_volume;
     pa_cvolume_set(&channel_volume, 1, volume);
     pa_threaded_mainloop_lock(impl_->mainloop);
-    if (!impl_->ready.load()) {
+    if (!impl_->ready.load() || impl_->context == nullptr) {
         pa_threaded_mainloop_unlock(impl_->mainloop);
         return false;
     }

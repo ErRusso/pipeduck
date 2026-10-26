@@ -215,9 +215,10 @@ struct TrayApp {
     std::optional<std::string> mic_label;
     bool quitting = false;
     // An incomplete restore leaves streams attached to an abandoned sink.
-    // Starting another session would not recover them, so keep the toggle
-    // disabled until the process is restarted.
+    // The toggle stays actionable: activating it sweeps those streams back to
+    // the default sink before starting a new session.
     bool restore_failed = false;
+    std::chrono::steady_clock::time_point last_toggle{};
     uint32_t menu_revision = 1;
     uint64_t last_cache_revision = 0;
     std::optional<std::filesystem::file_time_type> last_config_mtime;
@@ -293,16 +294,15 @@ struct TrayApp {
     }
 
     bool can_toggle() const {
-        return !quitting && !restore_failed && state != TrayRunState::Starting &&
-               state != TrayRunState::Stopping;
+        return tray_can_toggle(state, quitting);
     }
 
     // Routing identity (trigger, source, microphone, profile) is read-only
-    // while a worker is running. A failed selection that leaves state == Error
-    // must not unlock editing while the worker is still active.
+    // while a route session is active. While the worker is merely Waiting for
+    // its configured source, editing stays open: that is exactly when the
+    // selection needs correcting, and the worker reloads the config.
     bool editing_locked() const {
-        return quitting || worker_active.load() || state == TrayRunState::Starting ||
-               state == TrayRunState::Stopping;
+        return tray_editing_locked(state, worker_active.load(), quitting);
     }
 
     bool tuner_enabled() const {
@@ -324,6 +324,9 @@ struct TrayApp {
     void request_toggle();
     void start_worker();
     void stop_worker();
+    // Moves streams left behind on an abandoned pipeduck sink back to the
+    // current default sink. Returns false and keeps the error state on failure.
+    bool retry_restore();
     void post_event(const DuckingEvent& event);
     void dispatch_events();
     void notify_changed();
@@ -1010,6 +1013,15 @@ void TrayApp::stop_worker() {
 }
 
 void TrayApp::request_toggle() {
+    // SNI hosts may deliver Activate more than once for a double click (and the
+    // desktop launcher forwards activation to this process). Coalesce those
+    // repeats into a single toggle instead of turning ducking on and back off.
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_toggle < std::chrono::milliseconds(400)) {
+        return;
+    }
+    last_toggle = now;
+
     if (!can_toggle()) {
         return;
     }
@@ -1031,7 +1043,85 @@ void TrayApp::request_toggle() {
         }
         notify_changed();
     } else {
+        if (restore_failed && !retry_restore()) {
+            return;
+        }
         start_worker();
+    }
+}
+
+bool TrayApp::retry_restore() {
+    try {
+        // The tray may already be in fallback mode; never block on the cache.
+        const PulseCtl pulse;
+        const std::string configured_default = pulse.default_sink_name();
+        const auto sinks = pulse.sinks();
+        const auto inputs = pulse.sink_inputs();
+
+        std::vector<uint32_t> abandoned;
+        for (const auto& sink : sinks) {
+            if (starts_with(sink.name, "pipeduck")) {
+                abandoned.push_back(sink.index);
+            }
+        }
+        if (abandoned.empty()) {
+            restore_failed = false;
+            state = TrayRunState::Idle;
+            message = "No abandoned pipeduck sink found";
+            notify_changed();
+            return true;
+        }
+
+        // Never sweep streams back onto another abandoned sink.
+        std::string default_sink = configured_default;
+        if (starts_with(default_sink, "pipeduck")) {
+            default_sink.clear();
+            for (const auto& sink : sinks) {
+                if (!starts_with(sink.name, "pipeduck")) {
+                    default_sink = sink.name;
+                    break;
+                }
+            }
+            if (default_sink.empty()) {
+                state = TrayRunState::Error;
+                message = "Could not find a real output sink to restore audio to";
+                notify_changed();
+                return false;
+            }
+        }
+
+        int moved = 0;
+        std::string failed;
+        for (const auto& input : inputs) {
+            if (std::find(abandoned.begin(), abandoned.end(), input.sink) == abandoned.end()) {
+                continue;
+            }
+            try {
+                pulse.move_sink_input(input.index, default_sink);
+                ++moved;
+            } catch (const std::exception&) {
+                failed += " #" + std::to_string(input.index);
+            }
+        }
+
+        if (!failed.empty()) {
+            state = TrayRunState::Error;
+            message = "Could not move stream(s)" + failed + " off the pipeduck sink";
+            notify_changed();
+            return false;
+        }
+
+        restore_failed = false;
+        state = TrayRunState::Idle;
+        message = moved == 0 ? "No stranded streams found"
+                             : "Restored " + std::to_string(moved) + " stream(s)";
+        notify_changed();
+        return true;
+    } catch (const std::exception& error) {
+        state = TrayRunState::Error;
+        message = std::string("Could not restore audio routing: ") + error.what();
+        notify_changed();
+        return false;
     }
 }
 
@@ -1163,20 +1253,13 @@ void on_sni_method_call(GDBusConnection*, const gchar*, const gchar*, const gcha
                         GDBusMethodInvocation* invocation, gpointer user_data) {
     (void)parameters;
     auto* app = static_cast<TrayApp*>(user_data);
-    if (std::strcmp(method_name, "Activate") == 0 ||
-        std::strcmp(method_name, "SecondaryActivate") == 0) {
+    if (std::strcmp(method_name, "Activate") == 0) {
+        // A double click can deliver Activate twice; request_toggle debounces it.
         app->request_toggle();
-        g_dbus_method_invocation_return_value(invocation, nullptr);
-    } else if (std::strcmp(method_name, "ContextMenu") == 0) {
-        g_dbus_method_invocation_return_value(invocation, nullptr);
-    } else if (std::strcmp(method_name, "Scroll") == 0) {
-        app->request_toggle();
-        g_dbus_method_invocation_return_value(invocation, nullptr);
-    } else if (std::strcmp(method_name, "ProvideXdgActivationToken") == 0) {
-        g_dbus_method_invocation_return_value(invocation, nullptr);
-    } else {
-        g_dbus_method_invocation_return_value(invocation, nullptr);
     }
+    // SecondaryActivate/ContextMenu are handled by the host, Scroll is not a
+    // ducking control, and the remaining methods need no action.
+    g_dbus_method_invocation_return_value(invocation, nullptr);
 }
 
 GVariant* on_sni_get_property(GDBusConnection*, const gchar*, const gchar*, const gchar*,
@@ -1476,10 +1559,72 @@ int acquire_instance_lock() {
     return fd;
 }
 
+// The PID written by the lock holder is advisory: flock() is authoritative, so
+// stale contents after a crash are harmless.
+std::optional<pid_t> lock_file_pid() {
+    std::ifstream input(lock_path_string());
+    long long pid = 0;
+    if (!(input >> pid) || pid <= 0 || pid > 0x7fffffffLL) {
+        return std::nullopt;
+    }
+    return static_cast<pid_t>(pid);
+}
+
+// Ask the already running tray to act on an Activate request. The tray owns
+// org.kde.StatusNotifierItem-<pid>-1 for its lifetime, which is derived from the
+// PID in the lock file. This makes a desktop launcher activation work instead of
+// silently failing on the single-instance lock.
+bool forward_activation(pid_t pid) {
+    GError* error = nullptr;
+    GDBusConnection* bus = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &error);
+    if (bus == nullptr) {
+        if (error != nullptr) {
+            g_error_free(error);
+        }
+        return false;
+    }
+    const std::string service = "org.kde.StatusNotifierItem-" + std::to_string(pid) + "-1";
+    bool delivered = false;
+    // The running tray may still be acquiring its name right after startup.
+    for (int attempt = 0; attempt < 10 && !delivered; ++attempt) {
+        GVariant* reply = g_dbus_connection_call_sync(
+            bus, service.c_str(), kSniPath, kSniInterface, "Activate", g_variant_new("(ii)", 0, 0),
+            nullptr, G_DBUS_CALL_FLAGS_NONE, 1000, nullptr, &error);
+        if (reply != nullptr) {
+            g_variant_unref(reply);
+            delivered = true;
+            break;
+        }
+        if (error != nullptr) {
+            g_error_free(error);
+            error = nullptr;
+        }
+        g_usleep(100 * 1000);
+    }
+    g_object_unref(bus);
+    return delivered;
+}
+
 } // namespace
 
 int run_tray(const TrayOptions& options) {
-    const int lock_fd = acquire_instance_lock();
+    int lock_fd = -1;
+    try {
+        lock_fd = acquire_instance_lock();
+    } catch (const std::runtime_error&) {
+        // A second launch (typically the desktop icon) should activate the
+        // running instance instead of exiting silently.
+        std::optional<pid_t> holder = lock_file_pid();
+        for (int attempt = 0; attempt < 10 && !holder.has_value(); ++attempt) {
+            g_usleep(100 * 1000);
+            holder = lock_file_pid();
+        }
+        if (holder.has_value() && forward_activation(*holder)) {
+            std::cout << "pipeduck is already running; activated the tray icon.\n";
+            return 0;
+        }
+        throw;
+    }
 
     TrayApp app(options.settings);
     app.lock_fd = lock_fd;

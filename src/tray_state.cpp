@@ -32,6 +32,22 @@ std::string tray_state_value(TrayState state) {
     return tray_state_visible(state) ? "ON" : "OFF";
 }
 
+bool tray_can_toggle(TrayState state, bool quitting) {
+    return !quitting && state != TrayState::Starting && state != TrayState::Stopping;
+}
+
+bool tray_editing_locked(TrayState state, bool worker_active, bool quitting) {
+    if (quitting || state == TrayState::Starting || state == TrayState::Stopping) {
+        return true;
+    }
+    if (!worker_active) {
+        return false;
+    }
+    // Waiting means no usable source yet: that is when the selection has to be
+    // correctable without stopping ducking.
+    return state != TrayState::Waiting;
+}
+
 TrayReduction reduce_tray_event(TrayStatus status, const DuckingEvent& event) {
     bool changed = false;
     switch (event.type) {
